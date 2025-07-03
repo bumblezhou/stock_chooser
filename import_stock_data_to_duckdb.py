@@ -195,14 +195,13 @@ def main():
         else:
             column_definitions.append(f"{db_column} VARCHAR") # Default to VARCHAR for text fields
     
-    # Drop existing table and create a new one with defined schema
+    # Create the table if it does not exist. This ensures existing data is not deleted.
     try:
-        con.execute("DROP TABLE IF EXISTS stock_data;")
-        create_table_sql = f"CREATE TABLE stock_data ({', '.join(column_definitions)});"
+        create_table_sql = f"CREATE TABLE IF NOT EXISTS stock_data ({', '.join(column_definitions)});"
         con.execute(create_table_sql)
-        print("Table 'stock_data' created with defined schema.")
+        print("Table 'stock_data' ensured to exist with defined schema (or created if new).")
     except Exception as e:
-        print(f"Error creating table 'stock_data': {e}")
+        print(f"Error ensuring table 'stock_data' exists: {e}")
         con.close()
         return
 

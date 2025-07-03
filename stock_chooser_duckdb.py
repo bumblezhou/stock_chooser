@@ -15,7 +15,7 @@ def optimize_and_query_stock_data_duckdb():
 
     # 读取 .conf 文件
     config.read('./config.conf')
-    history_trading_days=config['settings']['history_trading_days']                             # 历史交易日选择范围。40: 40个交易日，60: 60个交易日，80: 80个交易日
+    history_trading_days=config['settings']['history_trading_days']                             # 历史交易日选择范围。40: N个交易日，60: 60个交易日，80: 80个交易日
     main_board_amplitude_threshold=config['settings']['main_board_amplitude_threshold']         # 主板振幅。25: 25%, 30: 30%, 35: 35%
     non_main_board_amplitude_threshold=config['settings']['non_main_board_amplitude_threshold'] # 创业板和科创板主板振幅。35: 35%， 40: 40%。
     max_market_capitalization=config['settings']['max_market_capitalization']                   # 最大流通市值，单位亿。
@@ -105,61 +105,68 @@ def optimize_and_query_stock_data_duckdb():
             stock_code,
             trade_date,
             stock_name,
+            (close_price - prev_close_price) / NULLIF(prev_close_price, 0) AS daily_gains,
             close_price,
             high_price,
             low_price,
+            industry_level2,
+            industry_level3,
             market_cap / 100000000 AS market_cap_of_100_million,
-            -- Calculate maximum close price within the 40-day window (not including current day)
-            -- 计算40天内（不含当日）的最高收盘价
+            -- 计算N个交易日内（不含当日）的最高收盘价
             MAX(close_price) OVER (
                 PARTITION BY stock_code
                 ORDER BY trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS max_close_40d,
-            -- Calculate maximum high price within the 40-day window (for amplitude calculation)
-            -- 计算40天窗口内（不含当日）的最高价格（用于幅度计算）
+            -- 计算N个交易日窗口内（不含当日）的最高价格（用于幅度计算）
             MAX(high_price) OVER (
                 PARTITION BY stock_code
                 ORDER BY trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS max_high_40d,
-            -- Calculate minimum low price within the 40-day window (for amplitude calculation)
-            -- 计算40天窗口内（不含当日）的最低价格（用于振幅计算）
+            -- 计算N个交易日窗口内（不含当日）的最低价格（用于振幅计算）
             MIN(low_price) OVER (
                 PARTITION BY stock_code
                 ORDER BY trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS min_low_40d,
-            -- Calculate minimum close price within the 40-day window (as denominator for amplitude calculation, to avoid division by zero)
-            -- 在40天的时间窗口内（不含当日）计算最低收盘价（作为振幅计算的分母，以避免除以零）
+            -- 在N个交易日的时间窗口内（不含当日）计算最低收盘价（作为振幅计算的分母，以避免除以零）
             MIN(close_price) OVER (
                 PARTITION BY stock_code
                 ORDER BY trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS min_close_40d_for_amplitude_base,
+            -- 在N个交易日内是否有涨幅(daily gains)大于5%的记录
+            MAX(CASE WHEN daily_gains >= 0.05 THEN 1 ELSE 0 END) OVER (
+                PARTITION BY stock_code
+                ORDER BY trade_date
+                ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
+            ) AS has_gain_5_percent
             -- Row number to ensure the window has at least 40 data points for calculation
             -- 行号以确保窗口至少有 40 个数据点用于计算
             ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trade_date) as rn
         FROM
             stock_data
         WHERE
-            stock_code NOT LIKE 'bj%' AND trade_date > '2022-01-01 00:00:00' AND market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
+            stock_code NOT LIKE 'bj%' AND trade_date > '2022-01-01 00:00:00'
     )
     SELECT
         sw.stock_code,
         sw.stock_name,
-        sw.trade_date
+        sw.trade_date,
+        industry_level2,
+        industry_level3
     FROM
         StockWindows sw
     WHERE
         -- Ensure the current window contains at least 40 trading days of data
-        -- 确保当前窗口包含至少40个交易日的数据
+        -- 确保当前窗口包含至少N个交易日的数据
         sw.rn > {history_trading_days}
-        -- Condition 1: Current day's close price is greater than or equal to the highest close price of the previous 40 trading days
-        -- 条件1：当日收盘价大于前40个交易日的最高收盘价
+        -- 条件1：当日收盘价大于前N个交易日的最高收盘价
         AND sw.close_price > sw.max_close_40d
-        -- Condition 2: The stock price amplitude over the previous 40 trading days meets the sector requirements
-        -- 条件2：前40个交易日的股票价格振幅度，上证和深证股票小于等于30%，创业板和科创析股票小于等于40%
+        -- 条件2：前N个交易日内有涨幅（大于等于5%）的K线
+        AND sw.has_gain_5_percent = 1
+        -- 条件3：前N个交易日的股票价格振幅度，上证和深证股票小于等于25%(30%, 35%)，创业板和科创析股票小于等于35%(40%, 40%)
         AND (
             -- Calculate amplitude percentage: (Max_High - Min_Low) / Min_Close * 100%
             -- If denominator is 0, set a very large value to fail the condition
@@ -175,19 +182,22 @@ def optimize_and_query_stock_data_duckdb():
             -- 根据股票代码前缀（板块）确定振幅阈值
             CASE
                 -- ChiNext board (starts with 300, 301, 302) or STAR market (starts with 688)
-                -- 创业板（以300，301，302开头）或科创板（以688开头），小于等于%40
+                -- 创业板（以300，301，302开头）或科创板（以688开头），小于等于35%(40%, 40%)
                 WHEN sw.stock_code LIKE 'sz300%' OR sw.stock_code LIKE 'sz301%' OR sw.stock_code LIKE 'sz302%' OR sw.stock_code LIKE 'sh688%' THEN {non_main_board_amplitude_threshold}
                 -- Shanghai Main Board (starts with 600, 601, 603, 605)
-                -- 上证主板（以600，601，603，605开头）小于等于30%
+                -- 上证主板（以600，601，603，605开头）小于等于25%(30%, 35%)
                 WHEN sw.stock_code LIKE 'sh600%' OR sw.stock_code LIKE 'sh601%' OR sw.stock_code LIKE 'sh603%' OR sw.stock_code LIKE 'sh605%' THEN {main_board_amplitude_threshold}
                 -- Shenzhen Main Board (starts with 000, 001, 002, 003)
-                -- 深证主板（以000，001，002，003开头）小于等于30%
+                -- 深证主板（以000，001，002，003开头）小于等于25%(30%, 35%)
                 WHEN sw.stock_code LIKE 'sz000%' OR sw.stock_code LIKE 'sz001%' OR sw.stock_code LIKE 'sz002%' OR sw.stock_code LIKE 'sz003%' THEN {main_board_amplitude_threshold}
                 -- Other stock types, set a high default threshold so they don't easily meet the condition
                 -- 至于其他板块，设置一个很高的振幅阈值，不作考虑
                 ELSE 1000
             END
         )
+        -- 条件4：流通市值在30亿至500亿之间
+        AND sw.market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
+        -- 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
     ORDER BY
         sw.stock_code, sw.trade_date;
     """
