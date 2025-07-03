@@ -15,6 +15,7 @@ def optimize_and_query_stock_data_duckdb():
 
     # 读取 .conf 文件
     config.read('./config.conf')
+    earliest_time_limit=config['settings']['earliest_time_limit']                               # 交易日期的最早时限，该日前的交易数据，不会被纳入选择
     history_trading_days=config['settings']['history_trading_days']                             # 历史交易日选择范围。40: N个交易日，60: 60个交易日，80: 80个交易日
     main_board_amplitude_threshold=config['settings']['main_board_amplitude_threshold']         # 主板振幅。25: 25%, 30: 30%, 35: 35%
     non_main_board_amplitude_threshold=config['settings']['non_main_board_amplitude_threshold'] # 创业板和科创板主板振幅。35: 35%， 40: 40%。
@@ -100,106 +101,201 @@ def optimize_and_query_stock_data_duckdb():
     # Main Query SQL (optimized for DuckDB)
     # The SQL is mostly the same as DuckDB handles window functions efficiently.
     query_sql = f"""
-    WITH StockWindows AS (
+    -- 📝 计算符合条件的股票交易日窗口
+    WITH YearEndReports AS (
+        -- ✅ 提取年报：report_date 以“1231”结尾，排除季度报/半年报
         SELECT
-            stock_code,
-            trade_date,
-            stock_name,
-            (close_price - prev_close_price) / NULLIF(prev_close_price, 0) AS daily_gains,
-            close_price,
-            high_price,
-            low_price,
-            industry_level2,
-            industry_level3,
-            market_cap / 100000000 AS market_cap_of_100_million,
-            -- 计算N个交易日内（不含当日）的最高收盘价
-            MAX(close_price) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
+            f.stock_code,
+            f.report_date,
+            f.publish_date,
+            f.R_np,                           -- 净利润
+            f.R_operating_total_revenue,      -- 营业总收入
+            ROW_NUMBER() OVER (
+                PARTITION BY f.stock_code, SUBSTR(f.report_date, 1, 4) -- 按年份分组
+                ORDER BY f.publish_date DESC                           -- 取最新发布的记录
+            ) AS rn
+        FROM stock_finance_data f
+        WHERE f.report_date LIKE '%1231'
+    ),
+    YearEndReportsUnique AS (
+        -- ✅ 保留每年最新的年报（去重）
+        SELECT *
+        FROM YearEndReports
+        WHERE rn = 1
+    ),
+    FinanceWithYoY AS (
+        -- ✅ 计算净利润和营业总收入同比增长率
+        SELECT
+            y1.stock_code,
+            y1.report_date,
+            y1.publish_date,
+            y1.R_np,
+            y1.R_operating_total_revenue,
+            -- ✅ 上一年度的净利润
+            LAG(y1.R_np, 1) OVER (
+                PARTITION BY y1.stock_code
+                ORDER BY y1.report_date
+            ) AS prev_year_R_np,
+            -- ✅ 上一年度的营业总收入
+            LAG(y1.R_operating_total_revenue, 1) OVER (
+                PARTITION BY y1.stock_code
+                ORDER BY y1.report_date
+            ) AS prev_year_revenue
+        FROM YearEndReportsUnique y1
+    ),
+    StockWindows AS (
+        SELECT
+            t.stock_code,
+            t.trade_date,
+            t.stock_name,
+            t.close_price,
+            t.high_price,
+            t.low_price,
+            t.industry_level2,
+            t.industry_level3,
+            -- ✅ 流通市值换算成“亿”
+            (t.market_cap / 100000000) AS market_cap_of_100_million,
+            f.R_np,
+            f.R_operating_total_revenue,
+            -- ✅ 计算净利润同比增长率
+            (f.R_np - f.prev_year_R_np) / NULLIF(f.prev_year_R_np, 0) AS net_profit_yoy,
+            -- ✅ 计算营业总收入同比增长率
+            (f.R_operating_total_revenue - f.prev_year_revenue) / NULLIF(f.prev_year_revenue, 0) AS revenue_yoy,
+            -- ✅ N个交易日内（不含当日）的最高收盘价
+            MAX(t.close_price) OVER (
+                PARTITION BY t.stock_code
+                ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            ) AS max_close_40d,
-            -- 计算N个交易日窗口内（不含当日）的最高价格（用于幅度计算）
-            MAX(high_price) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
+            ) AS max_close_n_days,
+            -- ✅ N个交易日窗口内（不含当日）的最高价（用于振幅计算）
+            MAX(t.high_price) OVER (
+                PARTITION BY t.stock_code
+                ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            ) AS max_high_40d,
-            -- 计算N个交易日窗口内（不含当日）的最低价格（用于振幅计算）
-            MIN(low_price) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
+            ) AS max_high_n_days,
+            -- ✅ N个交易日窗口内（不含当日）的最低价（用于振幅计算）
+            MIN(t.low_price) OVER (
+                PARTITION BY t.stock_code
+                ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            ) AS min_low_40d,
-            -- 在N个交易日的时间窗口内（不含当日）计算最低收盘价（作为振幅计算的分母，以避免除以零）
-            MIN(close_price) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
+            ) AS min_low_n_days,
+            -- ✅ N个交易日内（不含当日）的最低收盘价，用作振幅分母
+            MIN(t.close_price) OVER (
+                PARTITION BY t.stock_code
+                ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            ) AS min_close_40d_for_amplitude_base,
-            -- 在N个交易日内是否有涨幅(daily gains)大于5%的记录
-            MAX(CASE WHEN daily_gains >= 0.05 THEN 1 ELSE 0 END) OVER (
-                PARTITION BY stock_code
-                ORDER BY trade_date
+            ) AS min_close_n_days_for_amplitude_base,
+            -- ✅ N个交易日内是否存在单日涨幅 ≥ 5%
+            MAX(CASE
+                WHEN (t.close_price - t.prev_close_price) / NULLIF(t.prev_close_price, 0) >= 0.05 THEN 1
+                ELSE 0
+            END) OVER (
+                PARTITION BY t.stock_code
+                ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            ) AS has_gain_5_percent
-            -- Row number to ensure the window has at least 40 data points for calculation
-            -- 行号以确保窗口至少有 40 个数据点用于计算
-            ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trade_date) as rn
+            ) AS has_gain_5_percent,
+            -- ✅ 行号：确保窗口至少包含N个交易日
+            ROW_NUMBER() OVER (
+                PARTITION BY t.stock_code
+                ORDER BY t.trade_date
+            ) AS rn
         FROM
-            stock_data
+            stock_data t
+        LEFT JOIN FinanceWithYoY f
+            ON f.stock_code = t.stock_code
+        AND f.publish_date = (
+                -- ✅ 取最近一个已发布的年报
+                SELECT MAX(f2.publish_date)
+                FROM FinanceWithYoY f2
+                WHERE f2.stock_code = t.stock_code
+                AND CAST(f2.publish_date AS DATE) <= t.trade_date
+            )
         WHERE
-            stock_code NOT LIKE 'bj%' AND trade_date > '2022-01-01 00:00:00'
+            t.stock_code NOT LIKE 'bj%' -- 排除北交所股票
+            AND t.trade_date > '{earliest_time_limit}'
+    ),
+    FilteredRawData AS (
+        SELECT
+            sw.stock_code,
+            sw.stock_name,
+            sw.trade_date,
+            sw.close_price,
+            sw.industry_level2,
+            sw.industry_level3,
+            -- ✅ 标记连续交易日的“区块”
+            SUM(new_block_flag) OVER (PARTITION BY sw.stock_code ORDER BY sw.trade_date) AS block_id,
+            ROW_NUMBER() OVER (PARTITION BY sw.stock_code ORDER BY sw.trade_date) AS row_in_stock
+        FROM (
+            SELECT
+                *,
+                CASE
+                    WHEN LAG(trade_date) OVER (PARTITION BY stock_code ORDER BY trade_date) IS NULL THEN 1
+                    WHEN trade_date - LAG(trade_date) OVER (PARTITION BY stock_code ORDER BY trade_date) > 1 THEN 1
+                    ELSE 0
+                END AS new_block_flag
+            FROM StockWindows
+            WHERE
+                -- 📌 条件0：窗口内至少有N个交易日数据
+                rn > {history_trading_days}
+                -- 📌 条件1：当日收盘价大于前N个交易日的最高收盘价
+                AND close_price > max_close_n_days
+                -- 📌 条件2：前N个交易日内有涨幅（大于等于5%）的K线
+                AND has_gain_5_percent = 1
+                -- 📌 条件3：前N个交易日的股票价格振幅度，上证和深证股票小于等于25%(30%, 35%)，创业板和科创析股票小于等于35%(40%, 40%)
+                AND (
+                    -- ✅ 根据股票代码板块（前缀）确定振幅阈值
+                    CASE
+                        WHEN min_close_n_days_for_amplitude_base > 0
+                        THEN (max_high_n_days - min_low_n_days) * 1.0 / min_close_n_days_for_amplitude_base * 100
+                        ELSE 999999 -- 避免除零错误
+                    END
+                ) <= (
+                    CASE
+                        -- ✅ 创业板（以300，301，302开头）或科创板（以688开头），小于等于35%(40%, 40%)
+                        WHEN stock_code SIMILAR TO '(sz300|sz301|sz302|sh688)%' THEN {non_main_board_amplitude_threshold}
+                        -- ✅ 上证主板（以600，601，603，605开头）小于等于25%(30%, 35%)
+                        WHEN stock_code SIMILAR TO '(sh600|sh601|sh603|sh605)%' THEN {main_board_amplitude_threshold}
+                        -- ✅ 深证主板（以000，001，002，003开头）小于等于25%(30%, 35%)
+                        WHEN stock_code SIMILAR TO '(sz000|sz001|sz002|sz003)%' THEN {main_board_amplitude_threshold}
+                        ELSE 1000
+                    END
+                )
+                -- 📌 条件4：流通市值在30亿至500亿之间
+                AND market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
+                -- 📌 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
+                AND net_profit_yoy >= -0.2
+                AND revenue_yoy >= -0.2
+        ) AS sw
+    ),
+    BlockWithFilteredRows AS (
+        SELECT
+            *,
+            ROW_NUMBER() OVER (PARTITION BY stock_code, block_id ORDER BY trade_date) AS row_in_block,
+            COUNT(*) OVER (PARTITION BY stock_code, block_id) AS block_size,
+            COUNT(DISTINCT close_price) OVER (PARTITION BY stock_code, block_id) AS distinct_close_count
+        FROM FilteredRawData
+    ),
+    FinalResult AS (
+        SELECT *
+        FROM BlockWithFilteredRows
+        WHERE
+            -- ✅ 限制连续交易日 <= 20 天
+            block_size <= 20
+            -- 📌 条件1.1: 如果区块内收盘价连续相同，剔除前 N-1 条，仅保留最后一条
+            AND NOT (
+                row_in_block < block_size AND distinct_close_count = 1
+            )
+            -- 📌 条件1.2: 每个区块只保留最早的一条记录
+            AND row_in_block = 1
     )
     SELECT
-        sw.stock_code,
-        sw.stock_name,
-        sw.trade_date,
+        stock_code,
+        stock_name,
+        trade_date,
         industry_level2,
         industry_level3
-    FROM
-        StockWindows sw
-    WHERE
-        -- Ensure the current window contains at least 40 trading days of data
-        -- 确保当前窗口包含至少N个交易日的数据
-        sw.rn > {history_trading_days}
-        -- 条件1：当日收盘价大于前N个交易日的最高收盘价
-        AND sw.close_price > sw.max_close_40d
-        -- 条件2：前N个交易日内有涨幅（大于等于5%）的K线
-        AND sw.has_gain_5_percent = 1
-        -- 条件3：前N个交易日的股票价格振幅度，上证和深证股票小于等于25%(30%, 35%)，创业板和科创析股票小于等于35%(40%, 40%)
-        AND (
-            -- Calculate amplitude percentage: (Max_High - Min_Low) / Min_Close * 100%
-            -- If denominator is 0, set a very large value to fail the condition
-            -- 计算振幅百分比：(Max_High - Min_Low) / Min_Close * 100%
-            -- 如果分母为0，则设置一个非常大的值设置为以避免除零的错误
-            CASE
-                WHEN sw.min_close_40d_for_amplitude_base > 0
-                THEN (sw.max_high_40d - sw.min_low_40d) * 1.0 / sw.min_close_40d_for_amplitude_base * 100
-                ELSE 999999
-            END
-        ) <= (
-            -- Determine the amplitude threshold based on stock code prefix (sector)
-            -- 根据股票代码前缀（板块）确定振幅阈值
-            CASE
-                -- ChiNext board (starts with 300, 301, 302) or STAR market (starts with 688)
-                -- 创业板（以300，301，302开头）或科创板（以688开头），小于等于35%(40%, 40%)
-                WHEN sw.stock_code LIKE 'sz300%' OR sw.stock_code LIKE 'sz301%' OR sw.stock_code LIKE 'sz302%' OR sw.stock_code LIKE 'sh688%' THEN {non_main_board_amplitude_threshold}
-                -- Shanghai Main Board (starts with 600, 601, 603, 605)
-                -- 上证主板（以600，601，603，605开头）小于等于25%(30%, 35%)
-                WHEN sw.stock_code LIKE 'sh600%' OR sw.stock_code LIKE 'sh601%' OR sw.stock_code LIKE 'sh603%' OR sw.stock_code LIKE 'sh605%' THEN {main_board_amplitude_threshold}
-                -- Shenzhen Main Board (starts with 000, 001, 002, 003)
-                -- 深证主板（以000，001，002，003开头）小于等于25%(30%, 35%)
-                WHEN sw.stock_code LIKE 'sz000%' OR sw.stock_code LIKE 'sz001%' OR sw.stock_code LIKE 'sz002%' OR sw.stock_code LIKE 'sz003%' THEN {main_board_amplitude_threshold}
-                -- Other stock types, set a high default threshold so they don't easily meet the condition
-                -- 至于其他板块，设置一个很高的振幅阈值，不作考虑
-                ELSE 1000
-            END
-        )
-        -- 条件4：流通市值在30亿至500亿之间
-        AND sw.market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
-        -- 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
-    ORDER BY
-        sw.stock_code, sw.trade_date;
+    FROM FinalResult
+    ORDER BY stock_code, trade_date;
     """
 
     print("\n--- 分析查询计划 (DuckDB) ---")
