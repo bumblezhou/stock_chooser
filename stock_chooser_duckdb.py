@@ -4,6 +4,55 @@ from datetime import datetime, timedelta
 import time # Import time module for timing
 import configparser
 
+# 计算工作日间隔
+def calculate_workday_diff(dates):
+    dates = dates.values
+    return pd.Series([float('inf')] + [len(pd.date_range(start=dates[i-1], end=dates[i], freq='B')) - 1 for i in range(1, len(dates))])
+
+# 筛选函数：筛选结果后20个交易日内筛选出的日期不作为筛选结果。
+def filter_records(group):
+    if len(group) <= 1:
+        return group
+    group = group.copy()
+    group['workday_diff'] = calculate_workday_diff(group['trade_date'])
+    keep = [True] * len(group)  # 初始化保留标志
+    last_kept_idx = 0  # 记录最后保留的记录索引
+
+    # 从第二条记录开始检查
+    for i in range(1, len(group)):
+        # 计算当前记录与最后保留记录的间隔
+        workday_diff = len(pd.date_range(start=group.iloc[last_kept_idx]['trade_date'], end=group.iloc[i]['trade_date'], freq='B')) - 1
+        if workday_diff <= 20:
+            # 如果间隔≤20，删除最后保留的记录和当前记录
+            keep[last_kept_idx] = False
+            keep[i] = False
+        else:
+            # 保留当前记录，更新最后保留的索引
+            last_kept_idx = i
+
+    # 确保第一条记录保留
+    keep[0] = True
+    return group[keep].drop(columns='workday_diff')
+
+# 筛选函数：次高收盘价为前一个交易日收盘价的不作为筛选结果。
+def mark_records(group):
+    if len(group) <= 1:
+        return group
+    group = group.copy()
+    # 初始化标记列，0 表示保留，1 表示删除
+    group['delete_flag'] = 0
+    # 计算相邻记录的工作日间隔和价格差异
+    dates = group['trade_date'].values
+    prices = group['close_price'].values
+    for i in range(1, len(group)):
+        # 计算工作日间隔（忽略周末）
+        workday_diff = len(pd.date_range(start=dates[i-1], end=dates[i], freq='B')) - 1
+        # 如果间隔为1个工作日且后一条记录的 close_price 大于前一条
+        if workday_diff == 1 and prices[i] > prices[i-1]:
+            group.iloc[i, group.columns.get_loc('delete_flag')] = 1
+    return group
+
+# 从库中筛选符合条件的记录，处理后导出到结果csv文件。
 def optimize_and_query_stock_data_duckdb():
     """
     Connects to DuckDB, creates/ensures stock_data table exists (for testing),
@@ -21,79 +70,16 @@ def optimize_and_query_stock_data_duckdb():
     non_main_board_amplitude_threshold=config['settings']['non_main_board_amplitude_threshold'] # 创业板和科创板主板振幅。35: 35%， 40: 40%。
     max_market_capitalization=config['settings']['max_market_capitalization']                   # 最大流通市值，单位亿。
     min_market_capitalization=config['settings']['min_market_capitalization']                   # 最小流通市值，单位亿。
-    net_profit_growth_rate=config['settings']['history_trading_days']                           # 净利润增长率。-20: -20%。
-    total_revenue_growth_rate=config['settings']['history_trading_days']                        # 营业总收入增长率。-20: -20%。
+    net_profit_growth_rate=config['settings']['net_profit_growth_rate']                         # 净利润增长率。-20: -20%。
+    total_revenue_growth_rate=config['settings']['total_revenue_growth_rate']                   # 营业总收入增长率。-20: -20%。
+    use_cond_1_1_or_cond_1_2=config['settings']['use_cond_1_1_or_cond_1_2']                     # 使用条件1.1还是1.2进行筛选：1.1，使用条件1.1; 1.2, 使用条件1.2。
 
     # Connect to DuckDB database file
     # Ensure 'stock_data.duckdb' exists and contains data,
     # or uncomment the data generation part below for testing.
     con = duckdb.connect(database='stock_data.duckdb', read_only=False)
     print("连接到数据库: stock_data.duckdb")
-
-    # --- Optional: Data Generation for Testing ---
-    # If your 'stock_data.duckdb' file is not already populated,
-    # you can uncomment and run this section to generate some test data.
-    # It's recommended to run 'import_stock_data_to_duckdb.py' first
-    # to populate the database with more realistic data.
-    
-    # Define columns for the DataFrame to match your DuckDB schema
-    columns = [
-        'stock_code', 'stock_name', 'trade_date', 'open_price', 'high_price',
-        'low_price', 'close_price', 'prev_close_price', 'volume', 'turnover',
-        'market_cap', 'total_market_cap', 'net_profit_ttm', 'cash_flow_ttm',
-        'net_assets', 'total_assets', 'total_liabilities', 'net_profit_quarter',
-        'mid_investor_buy', 'mid_investor_sell', 'large_investor_buy',
-        'large_investor_sell', 'retail_investor_buy', 'retail_investor_sell',
-        'institutional_buy', 'institutional_sell', 'hs300_component',
-        'sse50_component', 'csi500_component', 'csi1000_component',
-        'csi2000_component', 'gem_component', 'industry_level1',
-        'industry_level2', 'industry_level3', 'price_0935', 'price_0945', 'price_0955'
-    ]
-    
-    # Define schema for the stock_data table for explicit creation
-    column_definitions = []
-    # This reflects the schema from `import_stock_data_to_duckdb.py`
-    header_mapping_for_schema_keys = [
-        'stock_code', 'stock_name', 'trade_date', 'open_price', 'high_price',
-        'low_price', 'close_price', 'prev_close_price', 'volume', 'turnover',
-        'market_cap', 'total_market_cap', 'net_profit_ttm', 'cash_flow_ttm',
-        'net_assets', 'total_assets', 'total_liabilities', 'net_profit_quarter',
-        'mid_investor_buy', 'mid_investor_sell', 'large_investor_buy',
-        'large_investor_sell', 'retail_investor_buy', 'retail_investor_sell',
-        'institutional_buy', 'institutional_sell', 'hs300_component',
-        'sse50_component', 'csi500_component', 'csi1000_component',
-        'csi2000_component', 'gem_component', 'industry_level1',
-        'industry_level2', 'industry_level3', 'price_0935', 'price_0945', 'price_0955'
-    ]
-
-    for db_column in header_mapping_for_schema_keys:
-        if db_column in ['open_price', 'high_price', 'low_price', 'close_price',
-                         'prev_close_price', 'volume', 'turnover', 'market_cap',
-                         'total_market_cap', 'net_profit_ttm', 'cash_flow_ttm',
-                         'net_assets', 'total_assets', 'total_liabilities',
-                         'net_profit_quarter', 'mid_investor_buy', 'mid_investor_sell',
-                         'large_investor_buy', 'large_investor_sell', 'retail_investor_buy',
-                         'retail_investor_sell', 'institutional_buy', 'institutional_sell',
-                         'price_0935', 'price_0945', 'price_0955']:
-            column_definitions.append(f"{db_column} DOUBLE")
-        elif db_column in ['hs300_component', 'sse50_component', 'csi500_component',
-                           'csi1000_component', 'csi2000_component', 'gem_component']:
-            column_definitions.append(f"{db_column} INTEGER")
-        elif db_column == 'trade_date':
-            column_definitions.append(f"{db_column} DATE")
-        else:
-            column_definitions.append(f"{db_column} VARCHAR")
             
-    # Always try to create the table just in case it doesn't exist or schema changed
-    try:
-        con.execute(f"CREATE TABLE IF NOT EXISTS stock_data ({', '.join(column_definitions)});")
-        print("Table 'stock_data' ensured to exist or created.")
-    except Exception as e:
-        print(f"Error ensuring table 'stock_data' exists: {e}")
-        # If table creation fails, it's critical, so close connection and exit
-        con.close()
-        return
-    
     # 查询库中的数据条数
     result = con.execute("SELECT COUNT(*) FROM stock_data;").fetchone()
     print(f"数据库中有{result[0]}条记录。")
@@ -221,82 +207,55 @@ def optimize_and_query_stock_data_duckdb():
             sw.trade_date,
             sw.close_price,
             sw.industry_level2,
-            sw.industry_level3,
-            -- ✅ 标记连续交易日的“区块”
-            SUM(new_block_flag) OVER (PARTITION BY sw.stock_code ORDER BY sw.trade_date) AS block_id,
-            ROW_NUMBER() OVER (PARTITION BY sw.stock_code ORDER BY sw.trade_date) AS row_in_stock
-        FROM (
-            SELECT
-                *,
-                CASE
-                    WHEN LAG(trade_date) OVER (PARTITION BY stock_code ORDER BY trade_date) IS NULL THEN 1
-                    WHEN trade_date - LAG(trade_date) OVER (PARTITION BY stock_code ORDER BY trade_date) > 1 THEN 1
-                    ELSE 0
-                END AS new_block_flag
-            FROM StockWindows
-            WHERE
-                -- 📌 条件0：窗口内至少有N个交易日数据
-                rn > {history_trading_days}
-                -- 📌 条件1：当日收盘价大于前N个交易日的最高收盘价
-                AND close_price > max_close_n_days
-                -- 📌 条件2：前N个交易日内有涨幅（大于等于5%）的K线
-                AND has_gain_5_percent = 1
-                -- 📌 条件3：前N个交易日的股票价格振幅度，上证和深证股票小于等于25%(30%, 35%)，创业板和科创析股票小于等于35%(40%, 40%)
-                AND (
-                    -- ✅ 根据股票代码板块（前缀）确定振幅阈值
-                    CASE
-                        WHEN min_close_n_days_for_amplitude_base > 0
-                        THEN (max_high_n_days - min_low_n_days) * 1.0 / min_close_n_days_for_amplitude_base * 100
-                        ELSE 999999 -- 避免除零错误
-                    END
-                ) <= (
-                    CASE
-                        -- ✅ 创业板（以300，301，302开头）或科创板（以688开头），小于等于35%(40%, 40%)
-                        WHEN stock_code SIMILAR TO '(sz300|sz301|sz302|sh688)%' THEN {non_main_board_amplitude_threshold}
-                        -- ✅ 上证主板（以600，601，603，605开头）小于等于25%(30%, 35%)
-                        WHEN stock_code SIMILAR TO '(sh600|sh601|sh603|sh605)%' THEN {main_board_amplitude_threshold}
-                        -- ✅ 深证主板（以000，001，002，003开头）小于等于25%(30%, 35%)
-                        WHEN stock_code SIMILAR TO '(sz000|sz001|sz002|sz003)%' THEN {main_board_amplitude_threshold}
-                        ELSE 1000
-                    END
-                )
-                -- 📌 条件4：流通市值在30亿至500亿之间
-                AND market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
-                -- 📌 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
-                AND net_profit_yoy >= -0.2
-                AND revenue_yoy >= -0.2
-        ) AS sw
-    ),
-    BlockWithFilteredRows AS (
-        SELECT
-            *,
-            ROW_NUMBER() OVER (PARTITION BY stock_code, block_id ORDER BY trade_date) AS row_in_block,
-            COUNT(*) OVER (PARTITION BY stock_code, block_id) AS block_size,
-            COUNT(DISTINCT close_price) OVER (PARTITION BY stock_code, block_id) AS distinct_close_count
-        FROM FilteredRawData
-    ),
-    FinalResult AS (
-        SELECT *
-        FROM BlockWithFilteredRows
+            sw.industry_level3
+        FROM
+            StockWindows AS sw
         WHERE
-            -- ✅ 限制连续交易日 <= 20 天
-            block_size <= 20
-            -- 📌 条件1.1: 如果区块内收盘价连续相同，剔除前 N-1 条，仅保留最后一条
-            AND NOT (
-                row_in_block < block_size AND distinct_close_count = 1
+            -- 📌 条件0：窗口内至少有N个交易日数据
+            rn > {history_trading_days}
+            -- 📌 条件1：当日收盘价大于前N个交易日的最高收盘价
+            AND close_price > max_close_n_days
+            -- 📌 条件2：前N个交易日内有涨幅（大于等于5%）的K线
+            AND has_gain_5_percent = 1
+            -- 📌 条件3：前N个交易日的股票价格振幅度，上证和深证股票小于等于25%(30%, 35%)，创业板和科创析股票小于等于35%(40%, 40%)
+            AND (
+                -- ✅ 根据股票代码板块（前缀）确定振幅阈值
+                CASE
+                    WHEN min_close_n_days_for_amplitude_base > 0
+                    THEN (max_high_n_days - min_low_n_days) * 1.0 / min_close_n_days_for_amplitude_base * 100
+                    ELSE 999999 -- 避免除零错误
+                END
+            ) <= (
+                CASE
+                    -- ✅ 创业板（以300，301，302开头）或科创板（以688开头），小于等于35%(40%, 40%)
+                    WHEN stock_code SIMILAR TO '(sz300|sz301|sz302|sh688)%' THEN {non_main_board_amplitude_threshold}
+                    -- ✅ 上证主板（以600，601，603，605开头）小于等于25%(30%, 35%)
+                    WHEN stock_code SIMILAR TO '(sh600|sh601|sh603|sh605)%' THEN {main_board_amplitude_threshold}
+                    -- ✅ 深证主板（以000，001，002，003开头）小于等于25%(30%, 35%)
+                    WHEN stock_code SIMILAR TO '(sz000|sz001|sz002|sz003)%' THEN {main_board_amplitude_threshold}
+                    ELSE 1000
+                END
             )
-            -- 📌 条件1.2: 每个区块只保留最早的一条记录
-            AND row_in_block = 1
+            -- 📌 条件4：流通市值在30亿至500亿之间
+            AND market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
+            -- 📌 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
+            AND net_profit_yoy >= {net_profit_growth_rate}
+            AND revenue_yoy >= {total_revenue_growth_rate}
     )
     SELECT
         stock_code,
         stock_name,
         trade_date,
+        close_price,
         industry_level2,
         industry_level3
-    FROM FinalResult
+    FROM FilteredRawData
     ORDER BY stock_code, trade_date;
     """
+
+    # # 调试代码
+    # print(f"SQL: {query_sql}")
+    # return
 
     print("\n--- 分析查询计划 (DuckDB) ---")
     # DuckDB provides 'EXPLAIN' for query plans
@@ -313,17 +272,36 @@ def optimize_and_query_stock_data_duckdb():
     end_time = time.time()
     print(f"筛选于: {end_time - start_time:.2f}秒内完成.")
 
+    # 确保 trade_date 是 datetime 格式
+    results_df['trade_date'] = pd.to_datetime(results_df['trade_date'])
+    # 按 stock_code 和 trade_date 升序排序
+    results_df = results_df.sort_values(['stock_code', 'trade_date'], ascending=[True, True]).reset_index(drop=True)
+
+    if use_cond_1_1_or_cond_1_2 == "1.1":
+        # 📌 条件1.1: 次高收盘价为前一个交易日收盘价的不作为筛选结果
+        # 按 stock_code 分组并添加删除标记
+        results_df = results_df.groupby('stock_code', group_keys=False).apply(mark_records)
+        # 删除标记为“删除”的记录
+        results_df = results_df[results_df['delete_flag'] == 0].drop(columns='delete_flag').reset_index(drop=True)
+
+    if use_cond_1_1_or_cond_1_2 == "1.2":
+        # 📌 条件1.2: 筛选结果后20个交易日内筛选出的日期不作为筛选结果
+        results_df = results_df.groupby('stock_code', group_keys=False).apply(filter_records).reset_index(drop=True)
+
     if not results_df.empty:
         num_results = len(results_df)
         print(f"\n筛选到 {num_results} 条股票及交易日期数据:")
-        # 如果筛选到的记录数小于50，则直接打印
-        print(results_df.head(50).to_string())
+        # # 如果筛选到的记录数小于50，则直接打印
+        # print(results_df.head(50).to_string())
+        new_df = results_df[results_df['stock_name'] == '招商南油'].copy()
+        print(new_df.to_string())
         if num_results > 50:
             # 否则导入到查询结果文件choose_result.csv文件中
             print("...")
             # Export to CSV with UTF-8 BOM encoding
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"stock_query_results_{timestamp}.csv"
+            filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per"
+            output_filename = f"stock_query_results_{timestamp}_cond{use_cond_1_1_or_cond_1_2}_{filter_conditions}.csv"
             try:
                 results_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
                 print(f"筛选结果 (共 {num_results} 条记录) 已导出到文件 {output_filename}.")
