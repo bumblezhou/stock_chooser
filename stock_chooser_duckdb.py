@@ -64,15 +64,28 @@ def optimize_and_query_stock_data_duckdb():
 
     # 读取 .conf 文件
     config.read('./config.conf')
-    earliest_time_limit=config['settings']['earliest_time_limit']                               # 交易日期的最早时限，该日前的交易数据，不会被纳入选择
-    history_trading_days=config['settings']['history_trading_days']                             # 历史交易日选择范围。40: N个交易日，60: 60个交易日，80: 80个交易日
-    main_board_amplitude_threshold=config['settings']['main_board_amplitude_threshold']         # 主板振幅。25: 25%, 30: 30%, 35: 35%
-    non_main_board_amplitude_threshold=config['settings']['non_main_board_amplitude_threshold'] # 创业板和科创板主板振幅。35: 35%， 40: 40%。
-    max_market_capitalization=config['settings']['max_market_capitalization']                   # 最大流通市值，单位亿。
-    min_market_capitalization=config['settings']['min_market_capitalization']                   # 最小流通市值，单位亿。
-    net_profit_growth_rate=config['settings']['net_profit_growth_rate']                         # 净利润增长率。-20: -20%。
-    total_revenue_growth_rate=config['settings']['total_revenue_growth_rate']                   # 营业总收入增长率。-20: -20%。
-    use_cond_1_1_or_cond_1_2=config['settings']['use_cond_1_1_or_cond_1_2']                     # 使用条件1.1还是1.2进行筛选：1.1，使用条件1.1; 1.2, 使用条件1.2。
+    earliest_time_limit=config['settings']['earliest_time_limit']                                   # 交易日期的最早时限，该日前的交易数据，不会被纳入选择
+    cond1_and_cond3=config['settings']['cond1_and_cond3']                                           # 条件1和条件3的配置项。
+    cond2=config['settings']['cond2']                                                               # 条件2：前N个交易日内有涨幅（大于等于5%）的K线
+    apply_cond2_or_not=config['settings']['apply_cond2_or_not']                                     # 是否启用条件2：yes, 启用; no: 不启用。
+    # history_trading_days=config['settings']['history_trading_days']                               # 条件1：历史交易日选择范围。40: N个交易日，60: 60个交易日，80: 80个交易日
+    # main_board_amplitude_threshold=config['settings']['main_board_amplitude_threshold']           # 条件3：主板振幅。25: 25%, 30: 30%, 35: 35%
+    # non_main_board_amplitude_threshold=config['settings']['non_main_board_amplitude_threshold']   # 条件3：创业板和科创板主板振幅。35: 35%， 40: 40%。
+    history_trading_days=cond1_and_cond3.split('_')[0]
+    main_board_amplitude_threshold=cond1_and_cond3.split('_')[1]
+    non_main_board_amplitude_threshold=cond1_and_cond3.split('_')[2]
+    max_market_capitalization=config['settings']['max_market_capitalization']                       # 最大流通市值，单位亿。
+    min_market_capitalization=config['settings']['min_market_capitalization']                       # 最小流通市值，单位亿。
+    net_profit_growth_rate=config['settings']['net_profit_growth_rate']                             # 净利润增长率。-20: -20%。
+    total_revenue_growth_rate=config['settings']['total_revenue_growth_rate']                       # 营业总收入增长率。-20: -20%。
+    use_cond_1_1_or_cond_1_2=config['settings']['use_cond_1_1_or_cond_1_2']                         # 使用条件1.1还是1.2进行筛选：1.1，使用条件1.1; 1.2, 使用条件1.2。
+
+    cond2_sql_where_clause = ''
+    if apply_cond2_or_not == 'yes':
+        cond2_sql_where_clause = 'AND has_gain_5_percent = 1'
+    if apply_cond2_or_not == 'no':
+        cond2_sql_where_clause = '-- AND has_gain_5_percent = 1'
+
 
     # Connect to DuckDB database file
     # Ensure 'stock_data.duckdb' exists and contains data,
@@ -173,7 +186,7 @@ def optimize_and_query_stock_data_duckdb():
             ) AS min_close_n_days_for_amplitude_base,
             -- ✅ N个交易日内是否存在单日涨幅 ≥ 5%
             MAX(CASE
-                WHEN (t.close_price - t.prev_close_price) / NULLIF(t.prev_close_price, 0) >= 0.05 THEN 1
+                WHEN (t.close_price - t.prev_close_price) / NULLIF(t.prev_close_price, 0) >= {cond2} THEN 1
                 ELSE 0
             END) OVER (
                 PARTITION BY t.stock_code
@@ -216,7 +229,8 @@ def optimize_and_query_stock_data_duckdb():
             -- 📌 条件1：当日收盘价大于前N个交易日的最高收盘价
             AND close_price > max_close_n_days
             -- 📌 条件2：前N个交易日内有涨幅（大于等于5%）的K线
-            AND has_gain_5_percent = 1
+            -- AND has_gain_5_percent = 1
+            {cond2_sql_where_clause}
             -- 📌 条件3：前N个交易日的股票价格振幅度，上证和深证股票小于等于25%(30%, 35%)，创业板和科创析股票小于等于35%(40%, 40%)
             AND (
                 -- ✅ 根据股票代码板块（前缀）确定振幅阈值
@@ -300,7 +314,7 @@ def optimize_and_query_stock_data_duckdb():
             print("...")
             # Export to CSV with UTF-8 BOM encoding
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per"
+            filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2"
             output_filename = f"stock_query_results_{timestamp}_cond{use_cond_1_1_or_cond_1_2}_{filter_conditions}.csv"
             try:
                 results_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
