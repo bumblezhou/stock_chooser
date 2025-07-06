@@ -9,8 +9,14 @@ def calculate_workday_diff(dates):
     dates = dates.values
     return pd.Series([float('inf')] + [len(pd.date_range(start=dates[i-1], end=dates[i], freq='B')) - 1 for i in range(1, len(dates))])
 
-# 筛选函数：筛选结果后20个交易日内筛选出的日期不作为筛选结果。
+# 筛选函数：筛选结果后N个交易日内筛选出的日期不作为筛选结果。
 def filter_records(group):
+    # 创建 ConfigParser 对象
+    config = configparser.ConfigParser()
+    config.read('./config.conf')
+    range_days_of_cond_1_2=config['settings']['range_days_of_cond_1_2']         # 使用条件1.2时，其后N个交易日设定值
+    range_days_of_cond_1_2=int(range_days_of_cond_1_2)
+
     if len(group) <= 1:
         return group
     group = group.copy()
@@ -22,7 +28,7 @@ def filter_records(group):
     for i in range(1, len(group)):
         # 计算当前记录与最后保留记录的间隔
         workday_diff = len(pd.date_range(start=group.iloc[last_kept_idx]['trade_date'], end=group.iloc[i]['trade_date'], freq='B')) - 1
-        if workday_diff <= 20:
+        if workday_diff <= range_days_of_cond_1_2:
             # 如果间隔≤20，删除最后保留的记录和当前记录
             keep[last_kept_idx] = False
             keep[i] = False
@@ -68,6 +74,7 @@ def optimize_and_query_stock_data_duckdb():
     cond1_and_cond3=config['settings']['cond1_and_cond3']                                           # 条件1和条件3的配置项。
     cond2=config['settings']['cond2']                                                               # 条件2：前N个交易日内有涨幅（大于等于5%）的K线
     apply_cond2_or_not=config['settings']['apply_cond2_or_not']                                     # 是否启用条件2：yes, 启用; no: 不启用。
+    apply_cond5_or_not=config['settings']['apply_cond5_or_not']                                     # 是否启用条件5：yes, 启用; no: 不启用。
     # history_trading_days=config['settings']['history_trading_days']                               # 条件1：历史交易日选择范围。40: N个交易日，60: 60个交易日，80: 80个交易日
     # main_board_amplitude_threshold=config['settings']['main_board_amplitude_threshold']           # 条件3：主板振幅。25: 25%, 30: 30%, 35: 35%
     # non_main_board_amplitude_threshold=config['settings']['non_main_board_amplitude_threshold']   # 条件3：创业板和科创板主板振幅。35: 35%， 40: 40%。
@@ -79,6 +86,7 @@ def optimize_and_query_stock_data_duckdb():
     net_profit_growth_rate=config['settings']['net_profit_growth_rate']                             # 净利润增长率。-20: -20%。
     total_revenue_growth_rate=config['settings']['total_revenue_growth_rate']                       # 营业总收入增长率。-20: -20%。
     use_cond_1_1_or_cond_1_2=config['settings']['use_cond_1_1_or_cond_1_2']                         # 使用条件1.1还是1.2进行筛选：1.1，使用条件1.1; 1.2, 使用条件1.2。
+    range_days_of_cond_1_2=config['settings']['range_days_of_cond_1_2']                             # 使用条件1.2时，其后N个交易日设定值
 
     cond2_sql_where_clause = ''
     if apply_cond2_or_not == 'yes':
@@ -86,6 +94,11 @@ def optimize_and_query_stock_data_duckdb():
     if apply_cond2_or_not == 'no':
         cond2_sql_where_clause = '-- AND has_gain_5_percent = 1'
 
+    cond5_sql_where_clause = ''
+    if apply_cond5_or_not == 'yes':
+        cond5_sql_where_clause = f'AND net_profit_yoy >= {net_profit_growth_rate} AND revenue_yoy >= {total_revenue_growth_rate}'
+    if apply_cond5_or_not == 'no':
+        cond5_sql_where_clause = f'-- AND net_profit_yoy >= {net_profit_growth_rate} AND revenue_yoy >= {total_revenue_growth_rate}'
 
     # Connect to DuckDB database file
     # Ensure 'stock_data.duckdb' exists and contains data,
@@ -179,11 +192,17 @@ def optimize_and_query_stock_data_duckdb():
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS min_low_n_days,
             -- ✅ N个交易日内（不含当日）的最低收盘价，用作振幅分母
-            MIN(t.close_price) OVER (
+            -- MIN(t.close_price) OVER (
+            --     PARTITION BY t.stock_code
+            --     ORDER BY t.trade_date
+            --     ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
+            -- ) AS min_close_n_days_for_amplitude_base,
+            -- ✅ N个交易日内（不含当日）的第一个交易日的开盘价，用作振幅分母
+            FIRST_VALUE(t.open_price) OVER (
                 PARTITION BY t.stock_code
                 ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            ) AS min_close_n_days_for_amplitude_base,
+            ) AS open_price_of_first_day_of_n_days,
             -- ✅ N个交易日内是否存在单日涨幅 ≥ 5%
             MAX(CASE
                 WHEN (t.close_price - t.prev_close_price) / NULLIF(t.prev_close_price, 0) >= {cond2} THEN 1
@@ -220,7 +239,21 @@ def optimize_and_query_stock_data_duckdb():
             sw.trade_date,
             sw.close_price,
             sw.industry_level2,
-            sw.industry_level3
+            sw.industry_level3,
+            (CASE
+                WHEN open_price_of_first_day_of_n_days > 0
+                THEN (max_high_n_days - min_low_n_days) * 1.0 / open_price_of_first_day_of_n_days * 100
+                ELSE 999999 -- 避免除零错误
+            END) AS amplify,
+            (CASE
+                -- ✅ 创业板（以300，301，302开头）或科创板（以688开头），小于等于35%(40%, 40%)
+                    WHEN sw.stock_code LIKE 'sz300%' OR sw.stock_code LIKE 'sz301%' OR sw.stock_code LIKE 'sz302%' OR sw.stock_code LIKE 'sh688%' THEN {non_main_board_amplitude_threshold}
+                -- ✅ 上证主板（以600，601，603，605开头）小于等于25%(30%, 35%)
+                WHEN sw.stock_code LIKE 'sh600%' OR sw.stock_code LIKE 'sh601%' OR sw.stock_code LIKE 'sh603%' OR sw.stock_code LIKE 'sh605%' THEN {main_board_amplitude_threshold}
+                -- ✅ 深证主板（以000，001，002，003开头）小于等于25%(30%, 35%)
+                WHEN sw.stock_code LIKE 'sz000%' OR sw.stock_code LIKE 'sz001%' OR sw.stock_code LIKE 'sz002%' OR sw.stock_code LIKE 'sz003%' THEN {main_board_amplitude_threshold}
+                ELSE 1000
+            END) AS threshold
         FROM
             StockWindows AS sw
         WHERE
@@ -235,32 +268,34 @@ def optimize_and_query_stock_data_duckdb():
             AND (
                 -- ✅ 根据股票代码板块（前缀）确定振幅阈值
                 CASE
-                    WHEN min_close_n_days_for_amplitude_base > 0
-                    THEN (max_high_n_days - min_low_n_days) * 1.0 / min_close_n_days_for_amplitude_base * 100
+                    WHEN open_price_of_first_day_of_n_days > 0
+                    THEN (max_high_n_days - min_low_n_days) * 1.0 / open_price_of_first_day_of_n_days * 100
                     ELSE 999999 -- 避免除零错误
                 END
             ) <= (
                 CASE
                     -- ✅ 创业板（以300，301，302开头）或科创板（以688开头），小于等于35%(40%, 40%)
-                    WHEN stock_code SIMILAR TO '(sz300|sz301|sz302|sh688)%' THEN {non_main_board_amplitude_threshold}
+                     WHEN sw.stock_code LIKE 'sz300%' OR sw.stock_code LIKE 'sz301%' OR sw.stock_code LIKE 'sz302%' OR sw.stock_code LIKE 'sh688%' THEN {non_main_board_amplitude_threshold}
                     -- ✅ 上证主板（以600，601，603，605开头）小于等于25%(30%, 35%)
-                    WHEN stock_code SIMILAR TO '(sh600|sh601|sh603|sh605)%' THEN {main_board_amplitude_threshold}
+                    WHEN sw.stock_code LIKE 'sh600%' OR sw.stock_code LIKE 'sh601%' OR sw.stock_code LIKE 'sh603%' OR sw.stock_code LIKE 'sh605%' THEN {main_board_amplitude_threshold}
                     -- ✅ 深证主板（以000，001，002，003开头）小于等于25%(30%, 35%)
-                    WHEN stock_code SIMILAR TO '(sz000|sz001|sz002|sz003)%' THEN {main_board_amplitude_threshold}
+                    WHEN sw.stock_code LIKE 'sz000%' OR sw.stock_code LIKE 'sz001%' OR sw.stock_code LIKE 'sz002%' OR sw.stock_code LIKE 'sz003%' THEN {main_board_amplitude_threshold}
                     ELSE 1000
                 END
             )
             -- 📌 条件4：流通市值在30亿至500亿之间
             AND market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
             -- 📌 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
-            AND net_profit_yoy >= {net_profit_growth_rate}
-            AND revenue_yoy >= {total_revenue_growth_rate}
+            --AND net_profit_yoy >= {net_profit_growth_rate} AND revenue_yoy >= {total_revenue_growth_rate}
+            {cond5_sql_where_clause}
     )
     SELECT
         stock_code,
         stock_name,
         trade_date,
         close_price,
+        amplify,
+        threshold,
         industry_level2,
         industry_level3
     FROM FilteredRawData
@@ -314,7 +349,10 @@ def optimize_and_query_stock_data_duckdb():
             print("...")
             # Export to CSV with UTF-8 BOM encoding
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2"
+            if use_cond_1_1_or_cond_1_2 == '1.2':
+                filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2_cond1.2_{range_days_of_cond_1_2}days_{apply_cond5_or_not}_cond5"
+            else:
+                filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2_{apply_cond5_or_not}_cond5"
             output_filename = f"stock_query_results_{timestamp}_cond{use_cond_1_1_or_cond_1_2}_{filter_conditions}.csv"
             try:
                 results_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
