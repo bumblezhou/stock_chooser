@@ -75,7 +75,7 @@ def optimize_and_query_stock_data_duckdb():
     cond2=config['settings']['cond2']                                                               # 条件2：前N个交易日内有涨幅（大于等于5%）的K线
     apply_cond2_or_not=config['settings']['apply_cond2_or_not']                                     # 是否启用条件2：yes, 启用; no: 不启用。
     apply_cond5_or_not=config['settings']['apply_cond5_or_not']                                     # 是否启用条件5：yes, 启用; no: 不启用。
-    # history_trading_days=config['settings']['history_trading_days']                               # 条件1：历史交易日选择范围。40: N个交易日，60: 60个交易日，80: 80个交易日
+    # history_trading_days=config['settings']['history_trading_days']                               # 条件1：历史交易日选择范围。40: 40个交易日，60: 60个交易日，80: 80个交易日
     # main_board_amplitude_threshold=config['settings']['main_board_amplitude_threshold']           # 条件3：主板振幅。25: 25%, 30: 30%, 35: 35%
     # non_main_board_amplitude_threshold=config['settings']['non_main_board_amplitude_threshold']   # 条件3：创业板和科创板主板振幅。35: 35%， 40: 40%。
     history_trading_days=cond1_and_cond3.split('_')[0]
@@ -114,7 +114,33 @@ def optimize_and_query_stock_data_duckdb():
     # The SQL is mostly the same as DuckDB handles window functions efficiently.
     query_sql = f"""
     -- 📝 计算符合条件的股票交易日窗口
-    WITH YearEndReports AS (
+    WITH DeduplicatedStockData AS (
+        -- ✅ 去掉 stock_data 中完全重复的行
+        SELECT *
+        FROM (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY stock_code, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap
+                    ORDER BY trade_date
+                ) AS rn
+            FROM stock_data
+        )
+        WHERE rn = 1
+    ),
+    DeduplicatedFinanceData AS (
+        -- ✅ 去掉 stock_finance_data 中完全重复的行
+        SELECT *
+        FROM (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY stock_code, report_date, publish_date, R_np, R_operating_total_revenue
+                    ORDER BY publish_date
+                ) AS rn
+            FROM stock_finance_data
+        )
+        WHERE rn = 1
+    ),
+    YearEndReports AS (
         -- ✅ 提取年报：report_date 以“1231”结尾，排除季度报/半年报
         SELECT
             f.stock_code,
@@ -126,7 +152,7 @@ def optimize_and_query_stock_data_duckdb():
                 PARTITION BY f.stock_code, SUBSTR(f.report_date, 1, 4) -- 按年份分组
                 ORDER BY f.publish_date DESC                           -- 取最新发布的记录
             ) AS rn
-        FROM stock_finance_data f
+        FROM DeduplicatedFinanceData f
         WHERE f.report_date LIKE '%1231'
     ),
     YearEndReportsUnique AS (
@@ -191,12 +217,6 @@ def optimize_and_query_stock_data_duckdb():
                 ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS min_low_n_days,
-            -- ✅ N个交易日内（不含当日）的最低收盘价，用作振幅分母
-            -- MIN(t.close_price) OVER (
-            --     PARTITION BY t.stock_code
-            --     ORDER BY t.trade_date
-            --     ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            -- ) AS min_close_n_days_for_amplitude_base,
             -- ✅ N个交易日内（不含当日）的第一个交易日的开盘价，用作振幅分母
             FIRST_VALUE(t.open_price) OVER (
                 PARTITION BY t.stock_code
@@ -218,7 +238,7 @@ def optimize_and_query_stock_data_duckdb():
                 ORDER BY t.trade_date
             ) AS rn
         FROM
-            stock_data t
+            DeduplicatedStockData t
         LEFT JOIN FinanceWithYoY f
             ON f.stock_code = t.stock_code
         AND f.publish_date = (
@@ -275,7 +295,7 @@ def optimize_and_query_stock_data_duckdb():
             ) <= (
                 CASE
                     -- ✅ 创业板（以300，301，302开头）或科创板（以688开头），小于等于35%(40%, 40%)
-                     WHEN sw.stock_code LIKE 'sz300%' OR sw.stock_code LIKE 'sz301%' OR sw.stock_code LIKE 'sz302%' OR sw.stock_code LIKE 'sh688%' THEN {non_main_board_amplitude_threshold}
+                    WHEN sw.stock_code LIKE 'sz300%' OR sw.stock_code LIKE 'sz301%' OR sw.stock_code LIKE 'sz302%' OR sw.stock_code LIKE 'sh688%' THEN {non_main_board_amplitude_threshold}
                     -- ✅ 上证主板（以600，601，603，605开头）小于等于25%(30%, 35%)
                     WHEN sw.stock_code LIKE 'sh600%' OR sw.stock_code LIKE 'sh601%' OR sw.stock_code LIKE 'sh603%' OR sw.stock_code LIKE 'sh605%' THEN {main_board_amplitude_threshold}
                     -- ✅ 深证主板（以000，001，002，003开头）小于等于25%(30%, 35%)
@@ -342,7 +362,8 @@ def optimize_and_query_stock_data_duckdb():
         print(f"\n筛选到 {num_results} 条股票及交易日期数据:")
         # # 如果筛选到的记录数小于50，则直接打印
         # print(results_df.head(50).to_string())
-        new_df = results_df[results_df['stock_name'] == '招商南油'].copy()
+        # new_df = results_df[results_df['stock_name'] == '招商南油'].copy()
+        new_df = results_df[results_df['stock_name'] == '赢时胜'].copy()
         print(new_df.to_string())
         if num_results > 50:
             # 否则导入到查询结果文件choose_result.csv文件中

@@ -1,0 +1,38 @@
+SELECT stock_code, stock_name, trade_date, open_price, prev_close_price, (open_price - prev_close_price) AS price_diff, (open_price - prev_close_price) / prev_close_price * 100 AS diff_percent
+FROM stock_data WHERE diff_percent > 15 AND trade_date > '2022-01-01 00:00:00' ORDER BY trade_date LIMIT 1000;
+
+COPY (SELECT stock_code, stock_name, trade_date, open_price, prev_close_price, (open_price - prev_close_price) AS price_diff, (open_price - prev_close_price) / prev_close_price * 100 AS diff_percent
+FROM stock_data WHERE diff_percent > 15 AND trade_date > '2022-01-01 00:00:00' ORDER BY trade_date) 
+TO './price_diff_greater_than_15_per.csv' 
+WITH (HEADER, DELIMITER ',');
+
+COPY (SELECT stock_code, stock_name, trade_date, open_price, prev_close_price, (open_price - prev_close_price) AS price_diff, (open_price - prev_close_price) / prev_close_price * 100 AS diff_percent
+FROM stock_data WHERE diff_percent > 15 AND trade_date > '2022-01-01 00:00:00' AND stock_code like 'sh%' ORDER BY trade_date) 
+TO './price_diff_greater_than_15_per.csv' 
+WITH (HEADER, DELIMITER ',');
+
+COPY (SELECT stock_code, stock_name, trade_date, open_price, close_price, high_price, low_price, prev_close_price, (open_price - prev_close_price) AS price_diff, (open_price - prev_close_price) / prev_close_price * 100 AS diff_percent
+FROM stock_data WHERE trade_date > '2025-05-01 00:00:00' AND trade_date <= '2025-08-31 23:59:59' AND stock_code = 'sz300377' ORDER BY trade_date) 
+TO './price_diff_of_yishisheng.csv' 
+WITH (HEADER, DELIMITER ',');
+
+SELECT stock_code, stock_name, trade_date, open_price, close_price, high_price, low_price, prev_close_price FROM stock_data WHERE prev_close_price != LAG(close_price) OVER (ORDER BY stock_date);
+
+COPY (
+    SELECT
+        stock_code,
+        stock_name,
+        trade_date,
+        open_price,
+        close_price,
+        high_price,
+        low_price,
+        prev_close_price
+    FROM (
+        SELECT *, LAG(close_price) OVER (ORDER BY trade_date) AS prev_day_close
+        FROM stock_data
+        WHERE trade_date > '2022-01-01 00:00:00'
+    ) AS t
+    WHERE prev_close_price != prev_day_close
+) TO './not_adjusted_data.csv'
+WITH (HEADER, DELIMITER ',');
