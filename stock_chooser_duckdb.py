@@ -48,12 +48,12 @@ def mark_records(group):
     # 初始化标记列，0 表示保留，1 表示删除
     group['delete_flag'] = 0
     # 计算相邻记录的工作日间隔和价格差异
-    dates = group['trade_date'].values
-    prices = group['adj_close_price'].values
+    dates = group['交易日期'].values
+    prices = group['前复权_收盘价'].values
     for i in range(1, len(group)):
         # 计算工作日间隔（忽略周末）
         workday_diff = len(pd.date_range(start=dates[i-1], end=dates[i], freq='B')) - 1
-        # 如果间隔为1个工作日且后一条记录的 adj_close_price 大于前一条
+        # 如果间隔为1个工作日且后一条记录的 前复权_收盘价 大于前一条
         if workday_diff == 1 and prices[i] > prices[i-1]:
             group.iloc[i, group.columns.get_loc('delete_flag')] = 1
     return group
@@ -116,14 +116,13 @@ def optimize_and_query_stock_data_duckdb():
     -- 📝 计算符合条件的股票交易日窗口
     WITH DeduplicatedStockData AS (
         -- ✅ 去掉 stock_data 中完全重复的行
-        SELECT DISTINCT stock_code, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap FROM stock_data
+        SELECT DISTINCT stock_code, stock_name, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap, industry_level2, industry_level3 FROM stock_data
     ),
     StockWithRiseFall AS (
         -- ✅ 计算复权涨跌幅，公式: 复权涨跌幅 = 收盘价 / 前收盘价 - 1
         SELECT *,
             (close_price / NULLIF(prev_close_price, 0)) - 1 AS rise_fall
         FROM DeduplicatedStockData
-        WHERE rn = 1
     ),
     AdjustmentFactorComputed AS (
         -- ✅ 计算复权因子, 公式: 复权因子 = (1 + 复权涨跌幅).cumprod()
@@ -222,7 +221,7 @@ def optimize_and_query_stock_data_duckdb():
             t.stock_code NOT LIKE 'bj%' AND
             t.trade_date > '{earliest_time_limit}'
     ),
-    FilteredRawData AS (
+    FilteredStockData AS (
         SELECT
             sw.stock_code,
             sw.stock_name,
@@ -236,8 +235,8 @@ def optimize_and_query_stock_data_duckdb():
         WHERE
             -- 📌 条件0：窗口内至少有N个交易日数据
             sw.rn > {history_trading_days}
-            -- 📌 条件1：当日收盘价大于前N个交易日的最高收盘价
-            AND sw.adj_close_price > sw.max_close_n_days
+            -- 📌 条件1：当日收盘价大于前N个交易日的最高收盘价的101%
+            AND sw.adj_close_price > (sw.max_close_n_days * 1.01)
             -- 📌 条件2：前N个交易日内有涨幅（大于等于5%）的K线
             -- AND sw.has_gain_5_percent = 1
             {cond2_sql_where_clause}
@@ -262,19 +261,108 @@ def optimize_and_query_stock_data_duckdb():
             )
             -- 📌 条件4：流通市值在30亿至500亿之间
             AND sw.market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
-            -- 📌 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
-            --AND sw.net_profit_yoy >= {net_profit_growth_rate} AND sw.revenue_yoy >= {total_revenue_growth_rate}
-            {cond5_sql_where_clause}
+    ),
+    DeduplicatedFinanceData AS (
+        -- ✅ 去掉 stock_finance_data 中完全重复的行, R_np: 报告净利润(Reported Net Profit), R_operating_total_revenue: 报告营业总收入(Reported Operating Total Revenue)
+        SELECT DISTINCT stock_code, report_date, R_np, R_operating_total_revenue FROM stock_finance_data
+        WHERE
+            -- ✅ 排除北交所股票
+            stock_code NOT LIKE 'bj%'
+            -- ✅ 排除2022年1月1号的交易数据
+            AND STRPTIME(report_date, '%Y%m%d') >= STRPTIME('{earliest_time_limit}', '%Y-%m-%d %H:%M:%S')
+    ),
+    LatestFinanceData AS (
+        -- 步骤 1: 为每个 stock_code 和 trade_date 找到最近的 stock_finance_data 记录
+        SELECT
+            s.stock_code,
+            s.trade_date,
+            MAX(f.report_date) AS latest_report_date
+        FROM FilteredStockData s
+        LEFT JOIN DeduplicatedFinanceData f
+            ON s.stock_code = f.stock_code
+            AND STRPTIME(f.report_date, '%Y%m%d') <= s.trade_date
+            AND STRPTIME(f.report_date, '%Y%m%d') >= STRPTIME('{earliest_time_limit}', '%Y-%m-%d %H:%M:%S')
+        GROUP BY s.stock_code, s.trade_date
+    ),
+    FinanceRecords AS (
+        -- 步骤 2 & 3: 获取最近财务记录的详细信息并找到去年同期的财务记录（去年同一季度）
+        SELECT 
+            l.stock_code,
+            l.trade_date,
+            l.latest_report_date,
+            f1.R_np AS latest_R_np,
+            f1.R_operating_total_revenue AS latest_R_operating_total_revenue,
+            CAST(
+                (CAST(SUBSTR(l.latest_report_date, 1, 4) AS INTEGER) - 1) || SUBSTR(l.latest_report_date, 5, 4) AS VARCHAR
+            ) AS last_year_report_date,
+            f2.R_np AS last_year_R_np,
+            f2.R_operating_total_revenue AS last_year_R_operating_total_revenue
+        FROM LatestFinanceData l
+        LEFT JOIN DeduplicatedFinanceData f1
+            ON l.stock_code = f1.stock_code
+            AND f1.report_date = l.latest_report_date
+        LEFT JOIN DeduplicatedFinanceData f2
+            ON l.stock_code = f2.stock_code
+            AND f2.report_date = CAST(
+                (CAST(SUBSTR(l.latest_report_date, 1, 4) AS INTEGER) - 1) || SUBSTR(l.latest_report_date, 5, 4) AS VARCHAR
+            )
+    ),
+    NetProfitAndRevenueYoy AS (
+        -- 步骤 4: 计算同比增长率
+        SELECT 
+            stock_code,
+            trade_date,
+            latest_report_date,
+            latest_R_np,
+            latest_R_operating_total_revenue,
+            last_year_report_date,
+            last_year_R_np,
+            last_year_R_operating_total_revenue,
+            -- 净利润同比增长率
+            CASE 
+                WHEN last_year_R_np IS NOT NULL AND last_year_R_np != 0
+                THEN ROUND((latest_R_np - last_year_R_np) / last_year_R_np * 100, 2)
+                ELSE NULL
+            END AS net_profit_yoy,
+            -- 营业总收入同比增长率
+            CASE 
+                WHEN last_year_R_operating_total_revenue IS NOT NULL AND last_year_R_operating_total_revenue != 0
+                THEN ROUND((latest_R_operating_total_revenue - last_year_R_operating_total_revenue) / last_year_R_operating_total_revenue * 100, 2)
+                ELSE NULL
+            END AS revenue_yoy
+        FROM FinanceRecords
+    ),
+    FilteredStockDataWithFinanceData AS (
+        SELECT
+            s.stock_code,
+            s.stock_name,
+            s.trade_date,
+            s.adj_close_price,
+            s.max_close_n_days,
+            s.industry_level2,
+            s.industry_level3,
+            f.net_profit_yoy,
+            f.revenue_yoy
+        FROM
+            FilteredStockData s
+        LEFT JOIN NetProfitAndRevenueYoy f 
+            ON f.stock_code = s.stock_code 
+            AND f.trade_date = s.trade_date
     )
     SELECT
-        stock_code,
-        stock_name,
-        trade_date,
-        ROUND(adj_close_price, 2) AS adj_close_price,
-        ROUND(max_close_n_days, 2) AS max_close_n_days,
-        industry_level2,
-        industry_level3
-    FROM FilteredRawData
+        stock_code AS 股票代码,
+        stock_name AS 股票名称,
+        trade_date AS 交易日期,
+        ROUND(adj_close_price, 2) AS 前复权_收盘价,
+        ROUND(max_close_n_days, 2) AS 前复权_前N天最高收盘价,
+        ROUND(net_profit_yoy, 2) AS 净利润同比增长率,
+        ROUND(revenue_yoy, 2) AS 营收同比增长率,
+        industry_level2 AS 所属领域2,
+        industry_level3 AS 所属领域3
+    FROM FilteredStockDataWithFinanceData
+    WHERE net_profit_yoy IS NOT NULL AND revenue_yoy IS NOT NULL
+        -- 📌 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
+        {cond5_sql_where_clause}
     ORDER BY stock_code, trade_date;
     """
 
@@ -297,20 +385,20 @@ def optimize_and_query_stock_data_duckdb():
     
 
     # 确保 trade_date 是 datetime 格式
-    results_df['trade_date'] = pd.to_datetime(results_df['trade_date'])
+    # results_df['trade_date'] = pd.to_datetime(results_df['trade_date'])
     # 按 stock_code 和 trade_date 升序排序
-    results_df = results_df.sort_values(['stock_code', 'trade_date'], ascending=[True, True]).reset_index(drop=True)
+    results_df = results_df.sort_values(['股票代码', '交易日期'], ascending=[True, True]).reset_index(drop=True)
 
     if use_cond_1_1_or_cond_1_2 == "1.1":
         # 📌 条件1.1: 次高收盘价为前一个交易日收盘价的不作为筛选结果
         # 按 stock_code 分组并添加删除标记
-        results_df = results_df.groupby('stock_code', group_keys=False).apply(mark_records)
+        results_df = results_df.groupby('股票代码', group_keys=False).apply(mark_records)
         # 删除标记为“删除”的记录
         results_df = results_df[results_df['delete_flag'] == 0].drop(columns='delete_flag').reset_index(drop=True)
 
     if use_cond_1_1_or_cond_1_2 == "1.2":
         # 📌 条件1.2: 筛选结果后20个交易日内筛选出的日期不作为筛选结果
-        results_df = results_df.groupby('stock_code', group_keys=False).apply(filter_records).reset_index(drop=True)
+        results_df = results_df.groupby('股票代码', group_keys=False).apply(filter_records).reset_index(drop=True)
 
     end_time = time.time()
     print(f"筛选于: {end_time - start_time:.2f}秒内完成.")
@@ -320,8 +408,8 @@ def optimize_and_query_stock_data_duckdb():
         print(f"\n筛选到 {num_results} 条股票及交易日期数据:")
         # # 如果筛选到的记录数小于50，则直接打印
         # print(results_df.head(50).to_string())
-        # new_df = results_df[results_df['stock_name'] == '招商南油'].copy()
-        new_df = results_df[results_df['stock_name'] == '赢时胜'].copy()
+        # new_df = results_df[results_df['股票名称'] == '招商南油'].copy()
+        new_df = results_df[results_df['股票名称'] == '赢时胜'].copy()
         print(new_df.to_string())
         if num_results > 50:
             # 否则导入到查询结果文件choose_result.csv文件中
