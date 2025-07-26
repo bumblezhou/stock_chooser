@@ -49,11 +49,11 @@ def mark_records(group):
     group['delete_flag'] = 0
     # 计算相邻记录的工作日间隔和价格差异
     dates = group['trade_date'].values
-    prices = group['adj_close_price'].values
+    prices = group['close_price'].values
     for i in range(1, len(group)):
         # 计算工作日间隔（忽略周末）
         workday_diff = len(pd.date_range(start=dates[i-1], end=dates[i], freq='B')) - 1
-        # 如果间隔为1个工作日且后一条记录的 adj_close_price 大于前一条
+        # 如果间隔为1个工作日且后一条记录的 close_price 大于前一条
         if workday_diff == 1 and prices[i] > prices[i-1]:
             group.iloc[i, group.columns.get_loc('delete_flag')] = 1
     return group
@@ -98,7 +98,7 @@ def optimize_and_query_stock_data_duckdb():
     if apply_cond5_or_not == 'yes':
         cond5_sql_where_clause = f'AND net_profit_yoy >= {net_profit_growth_rate} AND revenue_yoy >= {total_revenue_growth_rate}'
     if apply_cond5_or_not == 'no':
-        cond5_sql_where_clause = f''
+        cond5_sql_where_clause = f'-- AND net_profit_yoy >= {net_profit_growth_rate} AND revenue_yoy >= {total_revenue_growth_rate}'
 
     # Connect to DuckDB database file
     # Ensure 'stock_data.duckdb' exists and contains data,
@@ -116,7 +116,16 @@ def optimize_and_query_stock_data_duckdb():
     -- 📝 计算符合条件的股票交易日窗口
     WITH DeduplicatedStockData AS (
         -- ✅ 去掉 stock_data 中完全重复的行
-        SELECT DISTINCT stock_code, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap FROM stock_data
+        SELECT *
+        FROM (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY stock_code, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap
+                    ORDER BY trade_date
+                ) AS rn
+            FROM stock_data
+        )
+        WHERE rn = 1
     ),
     StockWithRiseFall AS (
         -- ✅ 计算复权涨跌幅，公式: 复权涨跌幅 = 收盘价 / 前收盘价 - 1
@@ -133,10 +142,10 @@ def optimize_and_query_stock_data_duckdb():
     ),
     LastRecordComputed AS (
         -- ✅ 获取每个 stock_code 的最后一条记录的收盘价和复权因子
-        SELECT 
-            t.stock_code,
-            t.close_price AS last_close_price,
-            t.adjustment_factor AS last_adjustment_factor
+            SELECT 
+            stock_code,
+            close_price AS last_close_price,
+            adjustment_factor AS last_adjustment_factor
         FROM (
             SELECT 
                 stock_code,
@@ -145,7 +154,7 @@ def optimize_and_query_stock_data_duckdb():
                 ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trade_date DESC) AS rn
             FROM AdjustmentFactorComputed
         ) t
-        WHERE t.rn = 1
+        WHERE rn = 1
     ),
     AdjustedStockData AS (
         SELECT 
@@ -153,10 +162,14 @@ def optimize_and_query_stock_data_duckdb():
             -- ✅ 计算前复权收盘价, 公式: 前复权收盘价 = 复权因子 * (最后一条数据的收盘价 / 最后一条数据的复权因子)
             a.adjustment_factor * (l.last_close_price / NULLIF(l.last_adjustment_factor, 0)) AS adj_close_price,
             -- ✅ 前复权其他价格
-            (a.open_price / NULLIF(a.close_price, 0)) * (a.adjustment_factor * (l.last_close_price / NULLIF(l.last_adjustment_factor, 0))) AS adj_open_price,
-            (a.high_price / NULLIF(a.close_price, 0)) * (a.adjustment_factor * (l.last_close_price / NULLIF(l.last_adjustment_factor, 0))) AS adj_high_price,
-            (a.low_price / NULLIF(a.close_price, 0)) * (a.adjustment_factor * (l.last_close_price / NULLIF(l.last_adjustment_factor, 0))) AS adj_low_price,
-            (a.prev_close_price / NULLIF(a.close_price, 0)) * (a.adjustment_factor * (l.last_close_price / NULLIF(l.last_adjustment_factor, 0))) AS adj_prev_close_price
+            (a.open_price / NULLIF(a.close_price, 0)) * 
+                (a.adjustment_factor * (l.last_close_price / NULLIF(l.last_adjustment_factor, 0))) AS adj_open_price,
+            (a.high_price / NULLIF(a.close_price, 0)) * 
+                (a.adjustment_factor * (l.last_close_price / NULLIF(l.last_adjustment_factor, 0))) AS adj_high_price,
+            (a.low_price / NULLIF(a.close_price, 0)) * 
+                (a.adjustment_factor * (l.last_close_price / NULLIF(l.last_adjustment_factor, 0))) AS adj_low_price,
+            (a.prev_close_price / NULLIF(a.close_price, 0)) * 
+                (a.adjustment_factor * (l.last_close_price / NULLIF(l.last_adjustment_factor, 0))) AS adj_prev_close_price
         FROM AdjustmentFactorComputed a
         LEFT JOIN LastRecordComputed l ON a.stock_code = l.stock_code
     ),
@@ -235,43 +248,16 @@ def optimize_and_query_stock_data_duckdb():
             StockWindows AS sw
         WHERE
             -- 📌 条件0：窗口内至少有N个交易日数据
-            sw.rn > {history_trading_days}
+            rn > {history_trading_days}
             -- 📌 条件1：当日收盘价大于前N个交易日的最高收盘价
-            AND sw.adj_close_price > sw.max_close_n_days
-            -- 📌 条件2：前N个交易日内有涨幅（大于等于5%）的K线
-            -- AND sw.has_gain_5_percent = 1
-            {cond2_sql_where_clause}
-            -- 📌 条件3：前N个交易日的股票价格振幅度，上证和深证股票小于等于25%(30%, 35%)，创业板和科创析股票小于等于35%(40%, 40%)
-            AND (
-                -- ✅ 根据股票代码板块（前缀）确定振幅阈值
-                CASE
-                    WHEN sw.open_price_of_first_day_of_n_days > 0
-                    THEN (sw.max_high_n_days - sw.min_low_n_days) * 1.0 / sw.open_price_of_first_day_of_n_days * 100
-                    ELSE 999999 -- 避免除零错误
-                END
-            ) <= (
-                CASE
-                    -- ✅ 创业板（以300，301，302开头）或科创板（以688开头），小于等于35%(40%, 40%)
-                    WHEN sw.stock_code LIKE 'sz300%' OR sw.stock_code LIKE 'sz301%' OR sw.stock_code LIKE 'sz302%' OR sw.stock_code LIKE 'sh688%' THEN {non_main_board_amplitude_threshold}
-                    -- ✅ 上证主板（以600，601，603，605开头）小于等于25%(30%, 35%)
-                    WHEN sw.stock_code LIKE 'sh600%' OR sw.stock_code LIKE 'sh601%' OR sw.stock_code LIKE 'sh603%' OR sw.stock_code LIKE 'sh605%' THEN {main_board_amplitude_threshold}
-                    -- ✅ 深证主板（以000，001，002，003开头）小于等于25%(30%, 35%)
-                    WHEN sw.stock_code LIKE 'sz000%' OR sw.stock_code LIKE 'sz001%' OR sw.stock_code LIKE 'sz002%' OR sw.stock_code LIKE 'sz003%' THEN {main_board_amplitude_threshold}
-                    ELSE 1000
-                END
-            )
-            -- 📌 条件4：流通市值在30亿至500亿之间
-            AND sw.market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
-            -- 📌 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
-            --AND sw.net_profit_yoy >= {net_profit_growth_rate} AND sw.revenue_yoy >= {total_revenue_growth_rate}
-            {cond5_sql_where_clause}
+            AND adj_close_price > max_close_n_days
     )
     SELECT
         stock_code,
         stock_name,
         trade_date,
-        ROUND(adj_close_price, 2) AS adj_close_price,
-        ROUND(max_close_n_days, 2) AS max_close_n_days,
+        adj_close_price,
+        max_close_n_days,
         industry_level2,
         industry_level3
     FROM FilteredRawData
@@ -294,53 +280,54 @@ def optimize_and_query_stock_data_duckdb():
     print("\n执行筛选...")
     start_time = time.time()
     results_df = con.execute(query_sql).fetchdf() # Fetch results directly as a Pandas DataFrame
-    
-
-    # 确保 trade_date 是 datetime 格式
-    results_df['trade_date'] = pd.to_datetime(results_df['trade_date'])
-    # 按 stock_code 和 trade_date 升序排序
-    results_df = results_df.sort_values(['stock_code', 'trade_date'], ascending=[True, True]).reset_index(drop=True)
-
-    if use_cond_1_1_or_cond_1_2 == "1.1":
-        # 📌 条件1.1: 次高收盘价为前一个交易日收盘价的不作为筛选结果
-        # 按 stock_code 分组并添加删除标记
-        results_df = results_df.groupby('stock_code', group_keys=False).apply(mark_records)
-        # 删除标记为“删除”的记录
-        results_df = results_df[results_df['delete_flag'] == 0].drop(columns='delete_flag').reset_index(drop=True)
-
-    if use_cond_1_1_or_cond_1_2 == "1.2":
-        # 📌 条件1.2: 筛选结果后20个交易日内筛选出的日期不作为筛选结果
-        results_df = results_df.groupby('stock_code', group_keys=False).apply(filter_records).reset_index(drop=True)
-
     end_time = time.time()
     print(f"筛选于: {end_time - start_time:.2f}秒内完成.")
 
-    if not results_df.empty:
-        num_results = len(results_df)
-        print(f"\n筛选到 {num_results} 条股票及交易日期数据:")
-        # # 如果筛选到的记录数小于50，则直接打印
-        # print(results_df.head(50).to_string())
-        # new_df = results_df[results_df['stock_name'] == '招商南油'].copy()
-        new_df = results_df[results_df['stock_name'] == '赢时胜'].copy()
-        print(new_df.to_string())
-        if num_results > 50:
-            # 否则导入到查询结果文件choose_result.csv文件中
-            print("...")
-            # Export to CSV with UTF-8 BOM encoding
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            if use_cond_1_1_or_cond_1_2 == '1.2':
-                filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2_cond1.2_{range_days_of_cond_1_2}days_{apply_cond5_or_not}_cond5"
-            else:
-                filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2_{apply_cond5_or_not}_cond5"
-            output_filename = f"stock_query_results_{timestamp}_cond{use_cond_1_1_or_cond_1_2}_{filter_conditions}.csv"
-            try:
-                results_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
-                print(f"筛选结果 (共 {num_results} 条记录) 已导出到文件 {output_filename}.")
-            except Exception as e:
-                print(f"导出到文件失败，原因: {e}")
-        print(f"总记录数: {num_results} 条.")
-    else:
-        print("\n没有找到符合条件的股票及期交易日期数据.")
+    new_df = results_df[results_df['stock_name'] == '赢时胜'].copy()
+    print(new_df.to_string())
+
+    # # 确保 trade_date 是 datetime 格式
+    # results_df['trade_date'] = pd.to_datetime(results_df['trade_date'])
+    # # 按 stock_code 和 trade_date 升序排序
+    # results_df = results_df.sort_values(['stock_code', 'trade_date'], ascending=[True, True]).reset_index(drop=True)
+
+    # if use_cond_1_1_or_cond_1_2 == "1.1":
+    #     # 📌 条件1.1: 次高收盘价为前一个交易日收盘价的不作为筛选结果
+    #     # 按 stock_code 分组并添加删除标记
+    #     results_df = results_df.groupby('stock_code', group_keys=False).apply(mark_records)
+    #     # 删除标记为“删除”的记录
+    #     results_df = results_df[results_df['delete_flag'] == 0].drop(columns='delete_flag').reset_index(drop=True)
+
+    # if use_cond_1_1_or_cond_1_2 == "1.2":
+    #     # 📌 条件1.2: 筛选结果后20个交易日内筛选出的日期不作为筛选结果
+    #     results_df = results_df.groupby('stock_code', group_keys=False).apply(filter_records).reset_index(drop=True)
+
+    # if not results_df.empty:
+    #     num_results = len(results_df)
+    #     print(f"\n筛选到 {num_results} 条股票及交易日期数据:")
+    #     # # 如果筛选到的记录数小于50，则直接打印
+    #     # print(results_df.head(50).to_string())
+    #     # new_df = results_df[results_df['stock_name'] == '招商南油'].copy()
+    #     new_df = results_df[results_df['stock_name'] == '赢时胜'].copy()
+    #     print(new_df.to_string())
+    #     if num_results > 50:
+    #         # 否则导入到查询结果文件choose_result.csv文件中
+    #         print("...")
+    #         # Export to CSV with UTF-8 BOM encoding
+    #         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    #         if use_cond_1_1_or_cond_1_2 == '1.2':
+    #             filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2_cond1.2_{range_days_of_cond_1_2}days_{apply_cond5_or_not}_cond5"
+    #         else:
+    #             filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2_{apply_cond5_or_not}_cond5"
+    #         output_filename = f"stock_query_results_{timestamp}_cond{use_cond_1_1_or_cond_1_2}_{filter_conditions}.csv"
+    #         try:
+    #             results_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
+    #             print(f"筛选结果 (共 {num_results} 条记录) 已导出到文件 {output_filename}.")
+    #         except Exception as e:
+    #             print(f"导出到文件失败，原因: {e}")
+    #     print(f"总记录数: {num_results} 条.")
+    # else:
+    #     print("\n没有找到符合条件的股票及期交易日期数据.")
 
     # Close the database connection
     con.close()
