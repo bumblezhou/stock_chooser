@@ -219,7 +219,8 @@ def optimize_and_query_stock_data_duckdb():
         WHERE
             -- ✅ 排除北交所股票
             t.stock_code NOT LIKE 'bj%' AND
-            t.trade_date > '{earliest_time_limit}'
+            -- ✅ 排除2022年1月1号之前的交易数据
+            t.trade_date >= '{earliest_time_limit}'
     ),
     FilteredStockData AS (
         SELECT
@@ -238,9 +239,8 @@ def optimize_and_query_stock_data_duckdb():
             -- 📌 条件1：当日收盘价大于前N个交易日的最高收盘价的101%
             AND sw.adj_close_price > (sw.max_close_n_days * 1.01)
             -- 📌 条件2：前N个交易日内有涨幅（大于等于5%）的K线
-            -- AND sw.has_gain_5_percent = 1
             {cond2_sql_where_clause}
-            -- 📌 条件3：前N个交易日的股票价格振幅度，上证和深证股票小于等于25%(30%, 35%)，创业板和科创析股票小于等于35%(40%, 40%)
+            -- 📌 条件3：前N个交易日的股票价格振幅度，上证和深证股票小于等于25%(30%, 35%)，创业板和科创板股票小于等于35%(40%, 40%)
             AND (
                 -- ✅ 根据股票代码板块（前缀）确定振幅阈值
                 CASE
@@ -268,7 +268,7 @@ def optimize_and_query_stock_data_duckdb():
         WHERE
             -- ✅ 排除北交所股票
             stock_code NOT LIKE 'bj%'
-            -- ✅ 排除2022年1月1号的交易数据
+            -- ✅ 排除2022年1月1号之前的交易数据
             AND STRPTIME(report_date, '%Y%m%d') >= STRPTIME('{earliest_time_limit}', '%Y-%m-%d %H:%M:%S')
     ),
     LatestFinanceData AS (
@@ -349,6 +349,7 @@ def optimize_and_query_stock_data_duckdb():
             ON f.stock_code = s.stock_code 
             AND f.trade_date = s.trade_date
     )
+    -- ✅ 最终输出
     SELECT
         stock_code AS 股票代码,
         stock_name AS 股票名称,
@@ -360,23 +361,35 @@ def optimize_and_query_stock_data_duckdb():
         industry_level2 AS 所属领域2,
         industry_level3 AS 所属领域3
     FROM FilteredStockDataWithFinanceData
-    WHERE net_profit_yoy IS NOT NULL AND revenue_yoy IS NOT NULL
+    WHERE '{apply_cond5_or_not}' = 'yes' 
+        AND net_profit_yoy IS NOT NULL 
+        AND revenue_yoy IS NOT NULL 
         -- 📌 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
         {cond5_sql_where_clause}
-    ORDER BY stock_code, trade_date;
+    UNION ALL
+    SELECT
+        stock_code AS 股票代码,
+        stock_name AS 股票名称,
+        trade_date AS 交易日期,
+        ROUND(adj_close_price, 2) AS 前复权_收盘价,
+        ROUND(max_close_n_days, 2) AS 前复权_前N天最高收盘价,
+        NULL AS 净利润同比增长率,
+        NULL AS 营收同比增长率,
+        industry_level2 AS 所属领域2,
+        industry_level3 AS 所属领域3
+    FROM FilteredStockData
+    WHERE '{apply_cond5_or_not}' = 'no'
+    ORDER BY 股票代码, 交易日期;
     """
 
     # # 调试代码
-    # print(f"SQL: {query_sql}")
+    print(f"SQL: {query_sql}")
     # return
 
-    print("\n--- 分析查询计划 (DuckDB) ---")
+    print("\n---------- 分析查询计划 (DuckDB) -------")
     # DuckDB provides 'EXPLAIN' for query plans
-    con.execute("EXPLAIN " + query_sql)
-    query_plan = con.fetchall()
-    for step in query_plan:
-        # print(step)
-        pass
+    query_plan = con.execute("EXPLAIN " + query_sql).fetchall()
+    print(query_plan)
     print("--------------------------------------\n")
 
     print("\n执行筛选...")
