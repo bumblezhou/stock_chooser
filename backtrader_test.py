@@ -310,7 +310,8 @@ class MyStrategy(bt.Strategy):
                 continue
 
             profit = self.broker.get_value() - self.broker.startingcash
-            print(f"股票: {stock_code}, 日期: {current_date}, 收盘价: {adj_close_price:.2f}, " f"开盘价: {adj_open_price:.2f}, 持仓: {self.getposition(data).size}, 持仓均价: {self.getposition(data).price:.2f}, 盈亏: {profit:.2f}")
+            profit_percent = profit / self.broker.startingcash * 100
+            print(f"股票: {stock_code}, 日期: {current_date}, 收盘价: {adj_close_price:.2f}, " f"开盘价: {adj_open_price:.2f}, 持仓: {self.getposition(data).size}, 持仓均价: {self.getposition(data).price:.2f}, 盈亏: {profit:.2f}, 盈亏比: {profit_percent:.2f}")
 
             # 如果有未完成的订单，跳过
             if self.orders.get(stock_code):
@@ -342,7 +343,7 @@ class MyStrategy(bt.Strategy):
                         # self.buy_stage[stock_code] = 2
                         print(f"按收盘价买入剩余50%：股票 {stock_code}, 数量: {second_buy_size}, 价格: {adj_close_price:.2f}")
                 
-                # 因为基本框架不支持一天内使用两个价格进行买入，则干脆使用均价进行一次买来进行模拟
+                # 因为基本框架不支持一天内使用两个价格进行买入，则干脆使用均价进行一次买入来进行模拟
                 total_buy_size = first_buy_size + second_buy_size
                 self.average_price = ((self.broker.get_cash() - self.broker.get_fundvalue()) / (total_buy_size))
                 total_cost = total_buy_size * self.average_price
@@ -350,6 +351,9 @@ class MyStrategy(bt.Strategy):
                 self.orders[stock_code] = self.buy(data=data, size=total_buy_size, price=self.average_price, exectype=bt.Order.Market)
                 self.buy_stage[stock_code] = 2
 
+            # 加入退出策略：如果亏损超过3%，则直接平仓退出
+            if profit_percent <= -3 and self.getposition(data).size > 0:
+                self.close()
     def stop(self):
         # 计算最终收益
         for data in self.datas:
