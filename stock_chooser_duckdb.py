@@ -383,13 +383,13 @@ def optimize_and_query_stock_data_duckdb():
     """
 
     # # 调试代码
-    print(f"SQL: {query_sql}")
+    # print(f"SQL: {query_sql}")
     # return
 
     print("\n---------- 分析查询计划 (DuckDB) -------")
     # DuckDB provides 'EXPLAIN' for query plans
-    query_plan = con.execute("EXPLAIN " + query_sql).fetchall()
-    print(query_plan)
+    # query_plan = con.execute("EXPLAIN " + query_sql).fetchall()
+    # print(query_plan)
     print("--------------------------------------\n")
 
     print("\n执行筛选...")
