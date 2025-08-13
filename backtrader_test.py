@@ -8,31 +8,30 @@ import configparser
 from datetime import datetime, timedelta
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from openpyxl.styles import Alignment, Font
 
 # 盈亏报告的字段映射
 PROFIT_LOSS_MAPPING = {
-    "holding_days": "持有天数",
+    "no": "编号",
     "stock_code": "股票代码",
     "stock_name": "股票名称", 
     "bought_date": "购入日期",
     "init_cash": "初始金额",
-    "pos_size": "头寸",
-    "pos_price": "均价",
-    "trade_date": "交易日期",
+    "trade_date": "结算日期",
+    "holding_days": "持有天数",
     "market_value": "市值(元)",
     "profit": "盈亏金额(元)",
-    "profit_percent": "盈亏比例"
+    "profit_percent": "盈亏比"
 }
 
 # 字段顺序
 PROFIT_LOSS_ORDER = [
-    "holding_days", 
+    "no",
     "stock_code", 
     "stock_name", 
     "bought_date", 
     "init_cash",
-    "pos_size",
-    "pos_price",
+    "holding_days", 
     "trade_date",
     "market_value",
     "profit", 
@@ -127,11 +126,11 @@ def get_next_N_days_data(stock_data_list, holding_day):
             stock_code,
             trade_date,
             stock_name,
-            volume AS vol,
-            adj_close_price,
-            adj_high_price,
-            adj_low_price,
-            adj_open_price,
+            volume,
+            adj_close_price AS close,
+            adj_high_price AS high,
+            adj_low_price AS low,
+            adj_open_price AS open,
             industry_level2,
             industry_level3
         FROM RankedData
@@ -157,7 +156,6 @@ class MyStrategy(bt.Strategy):
     params = (
         ('breakout_date', None),            # 突破日
         ('first_support_price', None),      # 第一支撑位价格
-        ('data_name', None),                # 新增参数：关联的数据名称
     )
 
     def __init__(self):
@@ -225,7 +223,7 @@ class MyStrategy(bt.Strategy):
                     print(f"开盘买入50%：股票 {stock_code}, 数量: {first_buy_size}, 价格: {adj_open_price:.2f}")
 
                 # 增加 1 天
-                next_day = current_date + timedelta(days=5)
+                next_day = current_date + timedelta(days=1)
 
                 second_buy_size = 0
                 second_buy_price = 0.00
@@ -237,7 +235,7 @@ class MyStrategy(bt.Strategy):
                     total_buy_size = first_buy_size + second_buy_size
                     average_price = round(((first_buy_size * first_buy_price + second_buy_size * second_buy_price) / total_buy_size), 2)
                     total_cost = round((total_buy_size * average_price), 2)
-                    if total_cost > (self.broker.get_cash() - self.broker.get_fundvalue()):
+                    while total_cost > (self.broker.get_cash() - self.broker.get_fundvalue()):
                         second_buy_size = second_buy_size - 1
                         total_buy_size = first_buy_size + second_buy_size
                         average_price = round(((first_buy_size * first_buy_price + second_buy_size * second_buy_price) / total_buy_size), 2)
@@ -257,11 +255,12 @@ class MyStrategy(bt.Strategy):
                     total_buy_size = first_buy_size + second_buy_size
                     average_price = round(((first_buy_size * first_buy_price + second_buy_size * second_buy_price) / total_buy_size), 2)
                     total_cost = round((total_buy_size * average_price), 2)
-                    if total_cost > (self.broker.get_cash() - self.broker.get_fundvalue()):
+                    while total_cost > (self.broker.get_cash() - self.broker.get_fundvalue()):
                         second_buy_size = second_buy_size - 1
                         total_buy_size = first_buy_size + second_buy_size
                         average_price = round(((first_buy_size * first_buy_price + second_buy_size * second_buy_price) / total_buy_size), 2)
                         total_cost = round((total_buy_size * average_price), 2)
+
                     if second_buy_size > 0:
                         # self.orders[stock_code] = self.buy(data=data, size=second_buy_size, price=adj_close_price)
                         # self.orders[stock_code] = self.buy(data=data, size=second_buy_size, price=adj_close_price, exectype=bt.Order.Limit, valid=next_day)
@@ -281,12 +280,13 @@ class MyStrategy(bt.Strategy):
             # 加入退出策略：如果亏损超过3%，则直接平仓退出
             if profit_percent <= -3 and self.getposition(data).size > 0:
                 self.close()
+
     def stop(self):
         # 计算最终收益
         for data in self.datas:
             profit = self.broker.get_value() - self.broker.startingcash
             profit_per = profit / self.broker.startingcash * 100
-            print(f"策略结束：股票 {data._name} 最终组合价值: {self.broker.get_value():.2f}, 利润: {profit:.2f}, 盈利率: {profit_per:.2f}%")
+            print(f"策略结束：股票 {data._name} 最终市值: {self.broker.get_value():.2f}, 利润: {profit:.2f}, 盈利率: {profit_per:.2f}%")
 
 # 获取股票数据并转换时间
 def convert_trade_date(df):
@@ -326,7 +326,7 @@ def export_to_excel_openpyxl_with_mapping(
             df = df[available_fields]
 
         # 3. 对数据进行排序
-        df = df.sort_values(by=["holding_days", "stock_code", "stock_name", "bought_date"], ascending=[True, True, True, True])
+        df = df.sort_values(by=["no", "holding_days", "stock_code", "stock_name", "bought_date"], ascending=[True, True, True, True, True])
 
         # 3. 映射列名
         if field_mapping:
@@ -345,7 +345,7 @@ def export_to_excel_openpyxl_with_mapping(
         green_fill = PatternFill(start_color="99FF99", end_color="99FF99", fill_type="solid")
 
         # 找到需要标色的列
-        color_cols = ["盈亏金额(元)"]
+        color_cols = ["市值(元)"]
         color_col_idx = {}
         for idx, col in enumerate(ws[1], start=1):
             if col.value in color_cols:
@@ -354,18 +354,50 @@ def export_to_excel_openpyxl_with_mapping(
         # 从第二行开始循环加颜色
         for row in range(2, ws.max_row + 1):
             for col_name, col_idx in color_col_idx.items():
-                cell = ws.cell(row=row, column=col_idx)
-                if isinstance(cell.value, (int, float)):
-                    if cell.value > 0:
-                        cell.fill = red_fill
-                    elif cell.value < 0:
-                        cell.fill = green_fill
+                cell_market = ws.cell(row=row, column=col_idx)
+                cell_profit = ws.cell(row=row, column=col_idx+1)
+                cell_profit_percent = ws.cell(row=row, column=col_idx+2)
+                cell_profit_percent.value = str(f"{float(cell_profit_percent.value):.2f}%")
+                cell_market.number_format = "0.00"
+                cell_profit.number_format = "0.00"
+                try:
+                    cell_profit_value = float(cell_profit.value) if cell_profit.value is not None else 0
+                    if cell_profit_value > 0:
+                        cell_market.fill = red_fill  # 正收益红色
+                        cell_profit.fill = red_fill
+                        cell_profit_percent.fill = red_fill
+                    elif cell_profit_value < 0:
+                        cell_market.fill = green_fill    # 负收益绿色
+                        cell_profit.fill = green_fill
+                        cell_profit_percent.fill = green_fill
+                    # 0 或 None 不着色（或可自定义）
+                except (ValueError, TypeError) as e:
+                    # print(f"Row {row}, Column {col_name}: Invalid value {cell_market.value}, Error: {e}")
+                    continue
+        
+        cell_summary1 = ws.cell(row=ws.max_row, column=color_col_idx["市值(元)"]+1)
+        # 设置居中（水平+垂直）
+        cell_summary1.alignment = Alignment(horizontal="center", vertical="center")
+        # 设置加粗
+        cell_summary1.font = Font(bold=True)
+
+        cell_summary2 = ws.cell(row=ws.max_row, column=color_col_idx["市值(元)"]-1)
+        # 设置居中（水平+垂直）
+        cell_summary2.alignment = Alignment(horizontal="center", vertical="center")
+        # 设置加粗
+        cell_summary2.font = Font(bold=True)
+
+        cell_summary3 = ws.cell(row=ws.max_row, column=color_col_idx["市值(元)"]-4)
+        # 设置居中（水平+垂直）
+        cell_summary3.alignment = Alignment(horizontal="center", vertical="center")
+        # 设置加粗
+        cell_summary3.font = Font(bold=True)
 
         wb.save(filename)
 
         print(f"✅ 回测数据已成功导出到 {filename}")
-        print(f"📖 回测数据预览:")
-        print(df.head())
+        # print(f"📖 回测数据预览:")
+        # print(df.head())
 
         return True
 
@@ -374,10 +406,10 @@ def export_to_excel_openpyxl_with_mapping(
         return False
 
 # 导出盈亏报告
-def export_profit_loss_report_excel(data_list, filename=None, add_timestamp=True):
+def export_profit_loss_report_excel(data_list, holding_day, filename=None, add_timestamp=True):
     """导出盈亏报告 Excel 版本"""
     if filename is None:
-        base_name = "盈亏报告"
+        base_name = "组合盈亏报告"
     else:
         if filename.endswith('.xlsx'):
             base_name = filename[:-5]
@@ -386,9 +418,9 @@ def export_profit_loss_report_excel(data_list, filename=None, add_timestamp=True
 
     if add_timestamp:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{base_name}_{timestamp}.xlsx"
+        filename = f"持有{holding_day}天{base_name}_{timestamp}.xlsx"
     else:
-        filename = f"{base_name}.xlsx"
+        filename = f"持有{holding_day}天{base_name}.xlsx"
 
     return export_to_excel_openpyxl_with_mapping(
         data_list=data_list,
@@ -430,19 +462,74 @@ def get_nth_next_trade_date(df, trade_date, stock_code, n):
     # 返回后第2条记录的 trade_date
     return df.index[idx_position + n]
 
+# 在交易的第一天，如果满足条件，则添加一条第一支撑位的交易数据，以支持交易当天回踩时买入
+def insert_first_support_price_data(df, first_support_price):
+    
+    # 获取第 0 行数据
+    high_value = df.iloc[0]['high']
+    low_value = df.iloc[0]['low']
+    open_value = df.iloc[0]['open']
+    close_value = df.iloc[0]['close']
+    current_date = pd.to_datetime(df.iloc[0]['trade_date'])
+    industry_level2 = df.iloc[0]['industry_level2']
+    industry_level3 = df.iloc[0]['industry_level3']
+    next_2_hour = current_date + timedelta(hours=2)
+    
+    # 计算新数据的 low 和 close
+    new_open_value = (first_support_price + open_value) / 2
+    new_value = (open_value + close_value) / 2
+    
+    # 创建新数据
+    if first_support_price >= low_value and first_support_price <= high_value and new_open_value < high_value:
+        new_data = pd.DataFrame({
+            'stock_code': [df.iloc[0]['stock_code']],
+            'trade_date': [next_2_hour],
+            'stock_name': [df.iloc[0]['stock_name']],
+            'volume': [df.iloc[0]['volume']],
+            'close': [close_value],     # 保持原 close
+            'high': [high_value],       # 保持原 high
+            'low': [low_value],         # 保持原 low
+            'open': [new_open_value],   # 使用 new_close_value 作为 open
+            'industry_level2': [industry_level2],
+            'industry_level3': [industry_level3]
+        })
+    else:
+        new_data = pd.DataFrame({
+            'stock_code': [df.iloc[0]['stock_code']],
+            'trade_date': [next_2_hour],
+            'stock_name': [df.iloc[0]['stock_name']],
+            'volume': [df.iloc[0]['volume']],
+            'close': [close_value],     # 保持原 close
+            'high': [high_value],       # 保持原 high
+            'low': [low_value],         # 保持原 low
+            'open': [new_value],        # 使用 new_value 作为 open
+            'industry_level2': [industry_level2],
+            'industry_level3': [industry_level3]
+        })
+    
+    # 合并数据
+    df = pd.concat([df, new_data], ignore_index=True)
+    
+    df = convert_trade_date(df)
+    
+    return df
+
 # 定义回测流程，支持多股票批量回测
-def run_backtest(stock_data_list, history_trading_days, holding_days):
+def run_backtest(stock_data_list, history_trading_days, holding_days, total_initial_cash):
     global PROFIT_AND_LOSS_SITUATION, INITIAL_CASH
+
+    INITIAL_CASH = total_initial_cash / len(stock_data_list)
 
     # 运行之前，先清空全局变量
     if len(PROFIT_AND_LOSS_SITUATION) > 0:
         PROFIT_AND_LOSS_SITUATION.clear()
 
     # 遍历每个突破日股票，分别加载数据和添加策略
-    for record in stock_data_list:
-        for holding_day in holding_days:
+    for holding_day in holding_days:
+        # 清空结果
+        PROFIT_AND_LOSS_SITUATION.clear()
+        for index, record in enumerate(stock_data_list):
             cerebro = bt.Cerebro()
-
             # 设置初始现金
             cerebro.broker.set_cash(INITIAL_CASH)
             # 设置佣金
@@ -457,6 +544,9 @@ def run_backtest(stock_data_list, history_trading_days, holding_days):
 
             # 获取突破日后N日行情数据（单只股票）
             df = get_next_N_days_data([record], holding_day)
+
+            # 调整一下第一天的交易数据，使可以支持回踩买入
+            df = insert_first_support_price_data(df, first_support_price)
             if df.empty:
                 print(f"股票 {stock_code} 在 {trade_date} 后无数据，跳过")
                 continue
@@ -468,15 +558,15 @@ def run_backtest(stock_data_list, history_trading_days, holding_days):
 
             # ==== 数据清洗 ====
             df.replace([np.inf, -np.inf], np.nan, inplace=True)
-            df.dropna(subset=['adj_close_price', 'adj_open_price', 'vol'], inplace=True)
-            df = df[df['vol'] >= 0]
+            df.dropna(subset=['close', 'open', 'volume'], inplace=True)
+            df = df[df['volume'] >= 0]
 
             if df.empty:
                 print(f"股票{stock_code}数据清洗后为空，跳过")
                 continue
 
             # 检查数据完整性
-            required_columns = ['adj_close_price', 'adj_open_price', 'adj_high_price', 'adj_low_price', 'vol']
+            required_columns = ['close', 'open', 'high', 'low', 'volume']
             if not all(col in df.columns for col in required_columns):
                 print(f"股票 {stock_code} 缺少必要列，跳过")
                 continue
@@ -486,16 +576,17 @@ def run_backtest(stock_data_list, history_trading_days, holding_days):
                 lines = ('open', 'high', 'low', 'close', 'volume', 'openinterest')
                 params = (
                     ('datetime', None),  # 使用索引作为时间
-                    ('open', 'adj_open_price'),
-                    ('high', 'adj_high_price'),
-                    ('low', 'adj_low_price'),
-                    ('close', 'adj_close_price'),
-                    ('volume', 'vol'),
+                    ('open', 'open'),
+                    ('high', 'high'),
+                    ('low', 'low'),
+                    ('close', 'close'),
+                    ('volume', 'volume'),
                     ('openinterest', None),  # 股票数据无未平仓合约，设为None
                 )
 
             data_feed = PandasData(dataname=df)
             # print(f"股票 {stock_code} 数据预览:\n{data_feed._dataname.head()}")
+
             # 加载该股票数据
             try:
                 cerebro.adddata(data_feed, name=stock_code)
@@ -513,40 +604,42 @@ def run_backtest(stock_data_list, history_trading_days, holding_days):
             current_trade_date = get_nth_next_trade_date(df, start_trade_date, stock_code, holding_day)
             current_trade_date_str = current_trade_date.date().strftime('%Y-%m-%d')
             print(f"=======================开始对股票[{stock_name}]模拟在[{start_trade_date_str}]日买入时持有[{holding_day}]天的回测======================")
-            print(f"起始组合价值: {cerebro.broker.startingcash:.2f}\n")
+            print(f"开始市值: {cerebro.broker.startingcash:.2f}\n")
             begin_value = cerebro.broker.startingcash
             cerebro.run()
             end_value = cerebro.broker.getvalue()
             profit = end_value - begin_value
             profit_percent = profit / begin_value * 100
             PROFIT_AND_LOSS_SITUATION.append({
+                "no": index,
                 "stock_code": stock_code,
                 "stock_name": stock_name,
                 "bought_date": start_trade_date_str,
                 "init_cash": INITIAL_CASH,
-                "pos_size": cerebro.broker.getposition(data_feed).size,
-                "pos_price": f"{cerebro.broker.getposition(data_feed).price:.2f}",
                 "holding_days": holding_day,
                 "trade_date": current_trade_date_str,
-                "market_value": f"{end_value:.2f}",
-                "profit": f"{profit:.2f}",
-                "profit_percent": f"{profit_percent:.2f}%"
+                "market_value": end_value,
+                "profit": profit,
+                "profit_percent": profit_percent
             })
-            print(f"结束组合价值: {cerebro.broker.getvalue():.2f}\n")
-            print(f"=======================开始对股票[{stock_name}]模拟在[{start_trade_date_str}]日买入时持有[{holding_day}]天的回测======================")
+            print(f"结束市值: {cerebro.broker.getvalue():.2f}\n")
+            print(f"=======================结束对股票[{stock_name}]模拟在[{start_trade_date_str}]日买入时持有[{holding_day}]天的回测======================")
             print("\n")
 
-            # 绘图前检查数据
-            for data in cerebro.datas:
-                df = data._dataname
-                if df['vol'].isna().any() or (df['vol'] == np.inf).any():
-                    print(f"警告: 股票 {data._name} 的成交量数据无效，跳过绘图")
-                    return
-            
-            # 绘制回测结果
-            # cerebro.plot()
-    
-    export_profit_loss_report_excel(PROFIT_AND_LOSS_SITUATION)
+        total_market_value = sum(item.get("market_value", 0) for item in PROFIT_AND_LOSS_SITUATION)
+        PROFIT_AND_LOSS_SITUATION.append({
+            "no":max(item.get("no", 0) for item in PROFIT_AND_LOSS_SITUATION)+1,
+            "stock_code": "",
+            "stock_name": "",
+            "bought_date": "初始金额",
+            "init_cash": total_initial_cash,
+            "holding_days": "",
+            "trade_date": "结算市值",
+            "market_value": total_market_value,
+            "profit": "组合盈利率:",
+            "profit_percent": (total_market_value - total_initial_cash) / total_initial_cash * 100
+        })
+        export_profit_loss_report_excel(PROFIT_AND_LOSS_SITUATION, holding_day)
 
 
 if __name__ == "__main__":
@@ -557,12 +650,14 @@ if __name__ == "__main__":
     # 读取 .conf 文件
     config.read('./config.conf')
     cond1_and_cond3=config['settings']['cond1_and_cond3']                                           # 条件1和条件3的配置项。
+    total_initial_cash_settings=config['settings']['total_initial_cash']                            # 初始金额
     holdingdays_settings=config['settings']['holdingdays']                                          # 持有天数配置
     history_trading_days=cond1_and_cond3.split('_')[0]
     holding_days = [int(x.strip()) for x in holdingdays_settings.split(',')]
+    total_initial_cash = float(total_initial_cash_settings)
 
     # 读取 CSV 文件，跳过第一行作为列名称
-    df = pd.read_csv('stock_query_results_20250809_233124_cond1.1_40days_25per_35per_no_cond2_yes_cond5.csv', header=0)
+    df = pd.read_csv('stock_query_results_20250813_122711_cond1.1_40days_25per_35per_no_cond2_yes_cond5.csv', header=0)
 
     # 将 DataFrame 转换为指定格式的列表
     stock_data_list = df[['交易日期', '股票代码', '股票名称', '前复权_收盘价', '前复权_前N天最高收盘价']].to_dict('records')
@@ -576,4 +671,4 @@ if __name__ == "__main__":
         d['first_support_price'] = d.pop('前复权_前N天最高收盘价')
 
     # 执行批量回测
-    run_backtest(stock_data_list, history_trading_days, holding_days)
+    run_backtest(stock_data_list, history_trading_days, holding_days, total_initial_cash)
