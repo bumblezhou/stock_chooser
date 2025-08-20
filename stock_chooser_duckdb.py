@@ -47,6 +47,11 @@ def mark_records(group):
     # 初始化标记列，0 表示保留，1 表示删除
     group['delete_flag'] = 0
 
+    pd_version = pd.__version__
+    if version.parse(pd_version) < version.parse("2.1.0"):
+        # 手动加回股票代码
+        group['股票代码'] = group.name
+
     if len(group) <= 1:
         return group
 
@@ -70,13 +75,13 @@ def apply_mark_records(results_df):
     if version.parse(pd_version) >= version.parse("2.1.0"):
         # ✅ pandas 2.1+：在 apply 里传 include_groups
         results_df = results_df.groupby('股票代码', group_keys=False).apply(
-            mark_records, include_groups=False
+            mark_records, include_groups=True
         )
     else:
-        # ✅ pandas 旧版本，不支持 include_groups
-        results_df = results_df.groupby(
-            '股票代码', group_keys=False
-        ).apply(lambda g: mark_records(g.drop(columns=['股票代码'])))
+        # ✅ pandas 旧版本
+        results_df = results_df.groupby('股票代码', group_keys=False).apply(
+            mark_records
+        ).reset_index(drop=True)
 
     return results_df
 
@@ -138,7 +143,7 @@ def optimize_and_query_stock_data_duckdb():
     -- 📝 计算符合条件的股票交易日窗口
     WITH DeduplicatedStockData AS (
         -- ✅ 去掉 stock_data 中完全重复的行
-        SELECT DISTINCT stock_code, stock_name, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap, industry_level1, industry_level2, industry_level3 FROM stock_data
+        SELECT DISTINCT stock_code, stock_name, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap, total_market_cap, industry_level1, industry_level2, industry_level3 FROM stock_data
     ),
     StockWithRiseFall AS (
         -- ✅ 计算复权涨跌幅，公式: 复权涨跌幅 = 收盘价 / 前收盘价 - 1
@@ -199,6 +204,8 @@ def optimize_and_query_stock_data_duckdb():
             t.industry_level3,
             -- ✅ 流通市值换算成“亿”
             (t.market_cap / 100000000) AS market_cap_of_100_million,
+            -- 
+            (t.total_market_cap / 100000000) AS total_market_cap_of_100_million,
             -- ✅ N个交易日内（不含当日）的最高收盘价, 使用的是复权后的收盘价
             MAX(t.adj_close_price) OVER (
                 PARTITION BY t.stock_code
@@ -253,6 +260,7 @@ def optimize_and_query_stock_data_duckdb():
             sw.adj_close_price,
             sw.max_close_n_days,
             sw.market_cap_of_100_million,
+            sw.total_market_cap_of_100_million,
             sw.industry_level1,
             sw.industry_level2,
             sw.industry_level3
@@ -365,6 +373,7 @@ def optimize_and_query_stock_data_duckdb():
             s.adj_close_price,
             s.max_close_n_days,
             s.market_cap_of_100_million,
+            s.total_market_cap_of_100_million,
             s.industry_level1,
             s.industry_level2,
             s.industry_level3,
@@ -391,6 +400,8 @@ def optimize_and_query_stock_data_duckdb():
         trade_date AS 交易日期,
         ROUND(adj_close_price, 2) AS 前复权_收盘价,
         ROUND(max_close_n_days, 2) AS 前复权_前{history_trading_days}天最高收盘价,
+        ROUND(market_cap_of_100_million, 2) AS "流市值(亿)",
+        ROUND(total_market_cap_of_100_million, 2) AS "总市值(亿)",
         ROUND(latest_R_np, 2) "季净利润(亿)",
         ROUND(latest_R_operating_total_revenue, 2) "季总营收(亿)",
         ROUND(net_profit_yoy, 2) AS 净利润同比增长率,
@@ -411,6 +422,8 @@ def optimize_and_query_stock_data_duckdb():
         trade_date AS 交易日期,
         ROUND(adj_close_price, 2) AS 前复权_收盘价,
         ROUND(max_close_n_days, 2) AS 前复权_前{history_trading_days}天最高收盘价,
+        ROUND(market_cap_of_100_million, 2) AS "流市值(亿)",
+        ROUND(total_market_cap_of_100_million, 2) AS "总市值(亿)",
         ROUND(latest_R_np, 2) "季净利润(亿)",
         ROUND(latest_R_operating_total_revenue, 2) "季总营收(亿)",
         ROUND(net_profit_yoy, 2) AS 净利润同比增长率,
@@ -466,8 +479,7 @@ def optimize_and_query_stock_data_duckdb():
         # # 如果筛选到的记录数小于50，则直接打印
         # print(results_df.head(50).to_string())
         # new_df = results_df[results_df['股票名称'] == '招商南油'].copy()
-        new_df = results_df[results_df['股票名称'] == '赢时胜'].copy()
-        print(new_df.to_string())
+        # print(new_df.to_string())
         if num_results > 50:
             # 否则导入到查询结果文件choose_result.csv文件中
             print("...")
