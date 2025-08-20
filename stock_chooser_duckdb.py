@@ -1,5 +1,6 @@
 import duckdb
 import pandas as pd
+from packaging import version
 from datetime import datetime, timedelta
 import time # Import time module for timing
 import configparser
@@ -42,11 +43,13 @@ def filter_records(group):
 
 # 筛选函数：次高收盘价为前一个交易日收盘价的不作为筛选结果。
 def mark_records(group):
-    if len(group) <= 1:
-        return group
     group = group.copy()
     # 初始化标记列，0 表示保留，1 表示删除
     group['delete_flag'] = 0
+
+    if len(group) <= 1:
+        return group
+
     # 计算相邻记录的工作日间隔和价格差异
     dates = group['交易日期'].values
     prices = group['前复权_收盘价'].values
@@ -57,6 +60,25 @@ def mark_records(group):
         if workday_diff == 1 and prices[i] > prices[i-1]:
             group.iloc[i, group.columns.get_loc('delete_flag')] = 1
     return group
+
+def apply_mark_records(results_df):
+    """
+    自动适配 pandas 版本，避免 groupby.apply 的 DeprecationWarning 或 TypeError
+    """
+    pd_version = pd.__version__
+
+    if version.parse(pd_version) >= version.parse("2.1.0"):
+        # ✅ pandas 2.1+：在 apply 里传 include_groups
+        results_df = results_df.groupby('股票代码', group_keys=False).apply(
+            mark_records, include_groups=False
+        )
+    else:
+        # ✅ pandas 旧版本，不支持 include_groups
+        results_df = results_df.groupby(
+            '股票代码', group_keys=False
+        ).apply(lambda g: mark_records(g.drop(columns=['股票代码'])))
+
+    return results_df
 
 # 从库中筛选符合条件的记录，处理后导出到结果csv文件。
 def optimize_and_query_stock_data_duckdb():
@@ -116,7 +138,7 @@ def optimize_and_query_stock_data_duckdb():
     -- 📝 计算符合条件的股票交易日窗口
     WITH DeduplicatedStockData AS (
         -- ✅ 去掉 stock_data 中完全重复的行
-        SELECT DISTINCT stock_code, stock_name, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap, industry_level2, industry_level3 FROM stock_data
+        SELECT DISTINCT stock_code, stock_name, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap, industry_level1, industry_level2, industry_level3 FROM stock_data
     ),
     StockWithRiseFall AS (
         -- ✅ 计算复权涨跌幅，公式: 复权涨跌幅 = 收盘价 / 前收盘价 - 1
@@ -172,6 +194,7 @@ def optimize_and_query_stock_data_duckdb():
             t.adj_high_price,
             t.adj_low_price,
             t.adj_open_price,
+            t.industry_level1,
             t.industry_level2,
             t.industry_level3,
             -- ✅ 流通市值换算成“亿”
@@ -229,6 +252,8 @@ def optimize_and_query_stock_data_duckdb():
             sw.trade_date,
             sw.adj_close_price,
             sw.max_close_n_days,
+            sw.market_cap_of_100_million,
+            sw.industry_level1,
             sw.industry_level2,
             sw.industry_level3
         FROM
@@ -339,8 +364,18 @@ def optimize_and_query_stock_data_duckdb():
             s.trade_date,
             s.adj_close_price,
             s.max_close_n_days,
+            s.market_cap_of_100_million,
+            s.industry_level1,
             s.industry_level2,
             s.industry_level3,
+            CASE WHEN f.latest_R_np IS NOT NULL 
+                THEN f.latest_R_np / 100000000 
+                ELSE NULL
+            END AS latest_R_np,
+            CASE WHEN f.latest_R_operating_total_revenue IS NOT NULL 
+                THEN f.latest_R_operating_total_revenue / 100000000 
+                ELSE NULL
+            END AS latest_R_operating_total_revenue,
             f.net_profit_yoy,
             f.revenue_yoy
         FROM
@@ -355,9 +390,12 @@ def optimize_and_query_stock_data_duckdb():
         stock_name AS 股票名称,
         trade_date AS 交易日期,
         ROUND(adj_close_price, 2) AS 前复权_收盘价,
-        ROUND(max_close_n_days, 2) AS 前复权_前N天最高收盘价,
+        ROUND(max_close_n_days, 2) AS 前复权_前{history_trading_days}天最高收盘价,
+        ROUND(latest_R_np, 2) "季净利润(亿)",
+        ROUND(latest_R_operating_total_revenue, 2) "季总营收(亿)",
         ROUND(net_profit_yoy, 2) AS 净利润同比增长率,
         ROUND(revenue_yoy, 2) AS 营收同比增长率,
+        industry_level1 AS 所属领域1,
         industry_level2 AS 所属领域2,
         industry_level3 AS 所属领域3
     FROM FilteredStockDataWithFinanceData
@@ -372,12 +410,15 @@ def optimize_and_query_stock_data_duckdb():
         stock_name AS 股票名称,
         trade_date AS 交易日期,
         ROUND(adj_close_price, 2) AS 前复权_收盘价,
-        ROUND(max_close_n_days, 2) AS 前复权_前N天最高收盘价,
-        NULL AS 净利润同比增长率,
-        NULL AS 营收同比增长率,
+        ROUND(max_close_n_days, 2) AS 前复权_前{history_trading_days}天最高收盘价,
+        ROUND(latest_R_np, 2) "季净利润(亿)",
+        ROUND(latest_R_operating_total_revenue, 2) "季总营收(亿)",
+        ROUND(net_profit_yoy, 2) AS 净利润同比增长率,
+        ROUND(revenue_yoy, 2) AS 营收同比增长率,
+        industry_level1 AS 所属领域1,
         industry_level2 AS 所属领域2,
         industry_level3 AS 所属领域3
-    FROM FilteredStockData
+    FROM FilteredStockDataWithFinanceData
     WHERE '{apply_cond5_or_not}' = 'no'
     ORDER BY 股票代码, 交易日期;
     """
@@ -405,7 +446,10 @@ def optimize_and_query_stock_data_duckdb():
     if use_cond_1_1_or_cond_1_2 == "1.1":
         # 📌 条件1.1: 次高收盘价为前一个交易日收盘价的不作为筛选结果
         # 按 stock_code 分组并添加删除标记
-        results_df = results_df.groupby('股票代码', group_keys=False).apply(mark_records)
+        results_df = apply_mark_records(results_df)
+        # 📌 确保 delete_flag 存在
+        if 'delete_flag' not in results_df.columns:
+            results_df['delete_flag'] = 0
         # 删除标记为“删除”的记录
         results_df = results_df[results_df['delete_flag'] == 0].drop(columns='delete_flag').reset_index(drop=True)
 
