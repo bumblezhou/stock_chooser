@@ -8,6 +8,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # ========== 参数配置 ==========
 MAX_HOLDING_TRADING_DAYS = 40   # 最大持有天数40天
 INITIAL_CASH = 100000         # 每股初始购买金额10万元
+BACKTEST_RESULT = {}
 # ========== 参数配置 ==========
 
 # 盈亏报告的字段映射
@@ -15,8 +16,10 @@ PROFIT_LOSS_MAPPING = {
     "no": "编号",
     "stock_code": "股票代码",
     "stock_name": "股票名称", 
-    "bought_date": "购入日期",
     "init_cash": "初始金额",
+    "bought_date": "购入日期",
+    "total_shares": "总仓位",
+    "cost_price": "成本价",
     "trade_date": "结算日期",
     "holding_days": "持有天数",
     "max_holding_days": "最大持有天数",
@@ -30,39 +33,24 @@ PROFIT_LOSS_ORDER = [
     "no",
     "stock_code", 
     "stock_name", 
-    "bought_date", 
     "init_cash",
-    "holding_days",
-    "max_holding_days", 
+    "bought_date", 
+    "total_shares",
+    "cost_price",
     "trade_date",
+    "holding_days",
+    "max_holding_days",
     "market_value",
     "profit", 
     "profit_percent"
 ]
 
-
-# 加载需要做回测运算的xslx文件，【注意：先把xls文件转换居xlsx格式！】
+# 加载需要做回测运算的xlsx文件
 def load_df_from_excel_file(file_path):
     df = None
     try:
         # 读取 Excel 文件的第一个工作表，第一行作为列名
         df = pd.read_excel(file_path, sheet_name=0, engine='openpyxl', header=0)
-        
-        # # 打印工作表名称
-        # print(f"Sheet name: {pd.ExcelFile(file_path).sheet_names[0]}")
-        
-        # # 打印列名
-        # print(f"Column names: {df.columns.tolist()}")
-        
-        # # 打印整个工作表内容
-        # print("\nDataFrame content:")
-        # print(df)
-        
-        # # 逐行打印数据（不包含列名）
-        # print("\nRow-by-row content:")
-        # for index, row in df.iterrows():
-        #     print(row.tolist())
-            
     except FileNotFoundError:
         print(f"Error: File '{file_path}' not found")
     except Exception as e:
@@ -80,13 +68,8 @@ def convert_date_format_of_df_column(df, column_name="备注"):
         return df
 
 def load_target_df():
-    # 读取 CSV 文件，跳过第一行作为列名称
-    # df = pd.read_csv('stock_query_results_20250813_122711_cond1.1_40days_25per_35per_no_cond2_yes_cond5.csv', header=0)
     df = load_df_from_excel_file("1009all.xlsx")
     convert_date_format_of_df_column(df=df)
-
-    # # 将 DataFrame 转换为指定格式的列表
-    # stock_data_list = df[['交易日期', '股票代码', '股票名称', '前复权_收盘价', '前复权_前N天最高收盘价']].to_dict('records')
 
     # 复制备注列为breakthrough_date
     df['breakthrough_date'] = df['备注']
@@ -100,10 +83,6 @@ def load_target_df():
             '支撑价': 'adj_support_price'}
         )[['trade_date', 'breakthrough_date', 'stock_code', 'stock_name', 'adj_stock_price', 'adj_support_price']].to_dict(orient='records')
     )
-
-    # for item in stock_data_list:
-    #     print(item)
-
     stock_data_df = pd.DataFrame(stock_data_list)
     return stock_data_df
 
@@ -215,25 +194,56 @@ def get_next_N_days_data(stock_data_list, holding_day):
     con.close()  # 关闭数据库连接
     return final_df
 
-def create_trade_result(stock_code, stock_name, init_cash, support_date, support_price, bought_date, cost_price, trade_date, trade_positions, holding_days, max_holding_days, market_value, profit, profit_percent):
-    return {
-        'stock_code': stock_code,
-        'stock_name': stock_name,
-        'init_cash': init_cash,
-        'support_date': support_date,
-        'support_price': support_price,
-        'bought_date': bought_date,
-        'cost_price': cost_price,
-        'trade_date': trade_date,
-        'trade_positions': trade_positions,
-        'holding_days': holding_days,
-        'max_holding_days': max_holding_days,
-        'market_value': market_value,
-        'profit': profit,
-        'profit_percent': profit_percent
-    }
+def update_position(stock_code, stock_name, support_date, support_price, trade_type, trade_date, trade_positions, trade_price, close_price, holding_days):
+    global BACKTEST_RESULT, INITIAL_CASH, MAX_HOLDING_TRADING_DAYS
+    if stock_code in BACKTEST_RESULT:
+        stock_data = BACKTEST_RESULT[stock_code]
+        stock_data["stock_code"] = stock_code
+        stock_data["stock_name"] = stock_name
+        stock_data["init_cash"] = INITIAL_CASH
+        stock_data["support_date"] = support_date
+        stock_data["support_price"] = support_price
+        stock_data["max_holding_days"] = MAX_HOLDING_TRADING_DAYS
+        stock_data["holding_days"] = holding_days
+        if trade_type == "sell":
+            stock_data["trade_date"] = max(trade_date, stock_data["trade_date"]) if "trade_date" in stock_data else trade_date
+            stock_data["current_positions"] = stock_data["current_positions"] - trade_positions
+            stock_data["current_cash"] = stock_data["current_cash"] + (trade_price * trade_positions)
+            stock_data["market_value"] = stock_data["current_positions"] * close_price
+            stock_data["profit"] =  stock_data["market_value"] + stock_data["current_cash"] - INITIAL_CASH
+            stock_data["profit_percent"] = ((stock_data["profit"] / INITIAL_CASH) * 100)
+        if trade_type == "buy":
+            stock_data["bought_date"] = min(trade_date, stock_data["bought_date"])
+            stock_data["total_shares"] = stock_data["total_shares"] + trade_positions
+            stock_data["current_positions"] = stock_data["current_positions"] + trade_positions
+            stock_data["current_cash"] = stock_data["current_cash"] - (trade_price * trade_positions)
+            stock_data["cost_price"] = ((INITIAL_CASH - stock_data["current_cash"]) / stock_data["current_positions"])
+            stock_data["market_value"] = stock_data["current_positions"] * close_price
+            stock_data["profit"] =  stock_data["market_value"] + stock_data["current_cash"] - INITIAL_CASH
+            stock_data["profit_percent"] = ((stock_data["profit"] / INITIAL_CASH) * 100)
+    else:
+        if trade_type == "buy":
+            stock_data = {}
+            stock_data["stock_code"] = stock_code
+            stock_data["stock_name"] = stock_name
+            stock_data["init_cash"] = INITIAL_CASH
+            stock_data["support_date"] = support_date
+            stock_data["support_price"] = support_price
+            stock_data["max_holding_days"] = MAX_HOLDING_TRADING_DAYS
+            stock_data["holding_days"] = holding_days
+            stock_data["bought_date"] = trade_date
+            stock_data["cost_price"] = trade_price
+            stock_data["current_cash"] = INITIAL_CASH - (trade_price * trade_positions)
+            stock_data["current_positions"] = trade_positions
+            stock_data["total_shares"] = trade_positions
+            stock_data["market_value"] = stock_data["current_positions"] * close_price
+            stock_data["profit"] = 0.00
+            stock_data["profit_percent"] = 0.00
+            BACKTEST_RESULT[stock_code] = stock_data
 
 def do_back_test():
+    global BACKTEST_RESULT
+    BACKTEST_RESULT.clear()
     # 获取数据
     target_df = load_target_df()
     stock_data_list = target_df[['trade_date', 'breakthrough_date', 'stock_code', 'stock_name', 'adj_stock_price', 'adj_support_price']].to_dict('records')
@@ -246,8 +256,8 @@ def do_back_test():
     # 按stock_code和trade_date进行排序
     stock_df = stock_df.sort_values(['stock_code', 'trade_date'])
 
-    results = []
-    stock_to_remaining = {}
+    # results = []
+    # stock_to_remaining = {}
 
     # 循环处理每一支要回测的股票数据
     for idx, target in target_df.iterrows():
@@ -275,11 +285,19 @@ def do_back_test():
         
         shares_morning = ((cash_morning / group.loc[bought_idx, 'open']) // 100) * 100
         cost_morning = shares_morning * group.loc[bought_idx, 'open']
-        remaining_morning = cash_morning - cost_morning
+        # remaining_morning = cash_morning - cost_morning
+        update_position(
+            stock_code, stock_name, support_date, support_price, "buy", bought_date,
+            shares_morning, group.loc[bought_idx, 'open'], group.loc[bought_idx, 'close'], 1
+        )
         
         shares_evening = ((cash_evening / group.loc[bought_idx, 'close']) // 100) * 100
         cost_evening = shares_evening * group.loc[bought_idx, 'close']
-        remaining_evening = cash_evening - cost_evening
+        # remaining_evening = cash_evening - cost_evening
+        update_position(
+            stock_code, stock_name, support_date, support_price, "buy", bought_date,
+            shares_evening, group.loc[bought_idx, 'close'], group.loc[bought_idx, 'close'], 1
+        )
         
         total_shares = shares_morning + shares_evening
         if total_shares == 0:
@@ -287,10 +305,10 @@ def do_back_test():
             continue    # 如果购入仓位为0，则忽略该股票。
         
         total_cost = cost_morning + cost_evening
-        remaining_cash = remaining_morning + remaining_evening
+        # remaining_cash = remaining_morning + remaining_evening
         cost_price = total_cost / total_shares
         
-        stock_to_remaining[stock_code] = remaining_cash
+        # stock_to_remaining[stock_code] = remaining_cash
         
         # 初始仓位
         current_position = total_shares
@@ -319,7 +337,7 @@ def do_back_test():
             current_low = group.loc[i, 'low']
             current_close = group.loc[i, 'close']
             
-            # 如果持有天数超过40个交易日，直接卖出
+            # 如果持有天数超过40个交易日，直接卖出（用收盘卖）
             if holding_days > MAX_HOLDING_TRADING_DAYS:
                 if i > bought_idx:
                     # 在第40个交易日卖出
@@ -327,32 +345,24 @@ def do_back_test():
                     sell_price = group.loc[prev_i, 'close']
                     current_date = group.loc[prev_i, 'trade_date']
                     holding_days -= 1  # 回退到前一天的交易日计数
-                    market_value = current_position * sell_price
-                    profit = market_value - (current_position * cost_price)
-                    profit_percent = (sell_price / cost_price - 1) * 100
-                    results.append(create_trade_result(
-                        stock_code, stock_name, initial_cash, support_date, support_price, bought_date, cost_price,
-                        current_date, current_position, holding_days, MAX_HOLDING_TRADING_DAYS,
-                        market_value, profit, profit_percent
-                    ))
+                    update_position(
+                        stock_code, stock_name, support_date, support_price, "sell", current_date,
+                        current_position, sell_price, current_close, holding_days
+                    )
                     holding = False
                     continue
             
-            # 检查止损价，低于止损价就卖出
+            # 检查止损价，低于止损价就卖出（用止损价卖）
             if current_low < stop_loss:
-                sell_price = min(current_open, stop_loss)
-                market_value = current_position * sell_price
-                profit = market_value - (current_position * cost_price)
-                profit_percent = (sell_price / cost_price - 1) * 100
-                results.append(create_trade_result(
-                    stock_code, stock_name, initial_cash, support_date, support_price, bought_date, cost_price,
-                    current_date, current_position, holding_days, MAX_HOLDING_TRADING_DAYS,
-                    market_value, profit, profit_percent
-                ))
+                sell_price = stop_loss
+                update_position(
+                    stock_code, stock_name, support_date, support_price, "sell", current_date,
+                    current_position, sell_price, current_close, holding_days
+                )
                 holding = False
                 continue
             
-            # 跌破支撑线但未跌破止损线，3日收不上去清仓，跌破止损线立即清仓。
+            # 跌破支撑线但未跌破止损线，3日收不上去清仓，跌破止损线立即清仓。（按收盘价卖）
             if current_low < support_price:
                 if current_close >= support_price:
                     recover_count = 0
@@ -360,14 +370,10 @@ def do_back_test():
                     recover_count += 1
                 if recover_count >= 3:
                     sell_price = current_close
-                    market_value = current_position * sell_price
-                    profit = market_value - (current_position * cost_price)
-                    profit_percent = (sell_price / cost_price - 1) * 100
-                    results.append(create_trade_result(
-                        stock_code, stock_name, initial_cash, support_date, support_price, bought_date, cost_price,
-                        current_date, current_position, holding_days, MAX_HOLDING_TRADING_DAYS,
-                        market_value, profit, profit_percent
-                    ))
+                    update_position(
+                        stock_code, stock_name, support_date, support_price, "sell", current_date,
+                        current_position, sell_price, current_close, holding_days
+                    )
                     holding = False
                     continue
             else:
@@ -376,21 +382,17 @@ def do_back_test():
             # Current rise
             current_rise = current_close / cost_price
             
-            # 涨幅达到10%时，卖出50%仓位
+            # 涨幅达到10%时，卖出50%仓位（用的是成本价*1.1卖出）
             if not half_sold and current_rise >= 1.10:
                 sell_position = current_position * 0.5
                 current_position -= sell_position
-                sell_price = current_close
-                market_value = sell_position * sell_price
-                profit = market_value - (sell_position * cost_price)
-                profit_percent = (sell_price / cost_price - 1) * 100
-                results.append(create_trade_result(
-                    stock_code, stock_name, initial_cash, support_date, support_price, bought_date, cost_price,
-                    current_date, sell_position, holding_days, MAX_HOLDING_TRADING_DAYS,
-                    market_value, profit, profit_percent
-                ))
+                sell_price = cost_price * 1.10
+                update_position(
+                    stock_code, stock_name, support_date, support_price, "sell", current_date,
+                    sell_position, sell_price, current_close, holding_days
+                )
                 half_sold = True
-                stop_loss = cost_price * 1.02
+                stop_loss = cost_price * 1.10
                 max_rise = 1.10
             
             # 剩余 50% 仓位的动态跟踪策略
@@ -411,91 +413,107 @@ def do_back_test():
                         rise_count = 0
                         max_rise = 1.30
                         stop_loss = cost_price * 1.30
+                    elif max_rise < 1.40 and current_rise >= 1.40:
+                        rise_break_date = current_date
+                        rise_count = 0
+                        max_rise = 1.40
+                        stop_loss = cost_price * 1.40
+                    elif max_rise < 1.50 and current_rise >= 1.50:
+                        rise_break_date = current_date
+                        rise_count = 0
+                        max_rise = 1.50
+                        stop_loss = cost_price * 1.50
+                    elif max_rise < 1.60 and current_rise >= 1.60:
+                        rise_break_date = current_date
+                        rise_count = 0
+                        max_rise = 1.60
+                        stop_loss = cost_price * 1.60
+                    elif max_rise < 1.70 and current_rise >= 1.70:
+                        rise_break_date = current_date
+                        rise_count = 0
+                        max_rise = 1.70
+                        stop_loss = cost_price * 1.70
+                    elif max_rise < 1.80 and current_rise >= 1.80:
+                        rise_break_date = current_date
+                        rise_count = 0
+                        max_rise = 1.80
+                        stop_loss = cost_price * 1.80
+                    elif max_rise < 1.90 and current_rise >= 1.90:
+                        rise_break_date = current_date
+                        rise_count = 0
+                        max_rise = 1.90
+                        stop_loss = cost_price * 1.90
                     
-                    # 最高到200%，届时止损线不再调整，直接清仓。
+                    # 最高到200%，届时止损线不再调整，直接清仓。（按200%价格卖）
                     if current_rise >= 2.00:
-                        sell_price = current_close
-                        market_value = current_position * sell_price
-                        profit = market_value - (current_position * cost_price)
-                        profit_percent = (sell_price / cost_price - 1) * 100
-                        results.append(create_trade_result(
-                            stock_code, stock_name, initial_cash, support_date, support_price, bought_date, cost_price,
-                            current_date, current_position, holding_days, MAX_HOLDING_TRADING_DAYS,
-                            market_value, profit, profit_percent
-                        ))
+                        sell_price = cost_price * 2.00
+                        update_position(
+                            stock_code, stock_name, support_date, support_price, "sell", current_date,
+                            current_position, sell_price, current_close, holding_days
+                        )
+                        current_position = 0
                         holding = False
                         continue
                 
-                # 2.2 否则若突破130%后，5个交易日不超过140%清仓。
+                # 2.2 否则若突破130%后，5个交易日不超过140%清仓。（按收盘价卖）
                 if rise_break_date is not None:
                     rise_count += 1  # 交易日计数
-                    next_level = max_rise + 0.10 if max_rise < 1.30 else 1.40
+                    next_level = max_rise + 0.10
                     if rise_count >= 5 and current_rise < next_level:
                         sell_price = current_close
-                        market_value = current_position * sell_price
-                        profit = market_value - (current_position * cost_price)
-                        profit_percent = (sell_price / cost_price - 1) * 100
-                        results.append(create_trade_result(
-                            stock_code, stock_name, initial_cash, support_date, support_price, bought_date, cost_price,
-                            current_date, current_position, holding_days, MAX_HOLDING_TRADING_DAYS,
-                            market_value, profit, profit_percent
-                        ))
+                        update_position(
+                            stock_code, stock_name, support_date, support_price, "sell", current_date,
+                            current_position, sell_price, current_close, holding_days
+                        )
+                        current_position = 0
                         holding = False
                         continue
                 
-                # 1. 回调至130%，立即卖出；
+                # 1. 回调至130%，立即卖出；（按130%价卖）
                 if current_low < stop_loss:
                     sell_price = stop_loss
-                    market_value = current_position * sell_price
-                    profit = market_value - (current_position * cost_price)
-                    profit_percent = (sell_price / cost_price - 1) * 100
-                    results.append(create_trade_result(
-                        stock_code, stock_name, initial_cash, support_date, support_price, bought_date, cost_price,
-                        current_date, current_position, holding_days, MAX_HOLDING_TRADING_DAYS,
-                        market_value, profit, profit_percent
-                    ))
+                    update_position(
+                        stock_code, stock_name, support_date, support_price, "sell", current_date,
+                        current_position, sell_price, current_close, holding_days
+                    )
+                    current_position = 0
                     holding = False
                     continue
                 
-                # 2.1 若未回调，但持有满20天，当天收盘前卖出。
-                if max_rise >= 1.30 and holding_days >= 20:
+                # 2.1 若未回调，但持有满40天，当天收盘前卖出。（按收盘价卖）
+                if max_rise >= current_rise and holding_days >= 40:
                     sell_price = current_close
-                    market_value = current_position * sell_price
-                    profit = market_value - (current_position * cost_price)
-                    profit_percent = (sell_price / cost_price - 1) * 100
-                    results.append(create_trade_result(
-                        stock_code, stock_name, initial_cash, support_date, support_price, bought_date, cost_price,
-                        current_date, current_position, holding_days, MAX_HOLDING_TRADING_DAYS,
-                        market_value, profit, profit_percent
-                    ))
+                    update_position(
+                        stock_code, stock_name, support_date, support_price, "sell", current_date,
+                        current_position, sell_price, current_close, holding_days
+                    )
+                    current_position = 0
                     holding = False
                     continue
             
-            # 最多持有40天，无论多少清仓
+            # 最多持有40天，无论多少清仓（按收盘价卖）
             if i == len(group) - 1 and holding:
                 sell_price = current_close
-                market_value = current_position * sell_price
-                profit = market_value - (current_position * cost_price)
-                profit_percent = (sell_price / cost_price - 1) * 100
-                results.append(create_trade_result(
-                    stock_code, stock_name, initial_cash, support_date, support_price, bought_date, cost_price,
-                    current_date, current_position, holding_days, MAX_HOLDING_TRADING_DAYS,
-                    market_value, profit, profit_percent
-                ))
+                update_position(
+                    stock_code, stock_name, support_date, support_price, "sell", current_date,
+                    current_position, sell_price, current_close, holding_days
+                )
+                current_position = 0
                 holding = False
 
     # 以下部分保持不变
-    final_df = pd.DataFrame(results)
+    final_df = pd.DataFrame(list(BACKTEST_RESULT.values()))
 
     # 按股票代码和股票名称对交易数据进行汇总
     merged_df = final_df.groupby(['stock_code', 'stock_name']).agg(
         bought_date=('bought_date', 'min'),
         init_cash=('init_cash', 'max'),
+        total_shares=('total_shares', 'max'),
         cost_price=('cost_price', 'max'),
         trade_date=('trade_date', 'max'),
         support_date=('support_date', 'max'),
         support_price=('support_price', 'max'),
-        trade_positions=('trade_positions', 'sum'),
+        current_cash=('current_cash', 'sum'),
         holding_days=('holding_days', 'max'),
         max_holding_days=('max_holding_days', 'max'),
         market_value=('market_value', 'sum'),
@@ -505,37 +523,40 @@ def do_back_test():
     # 如果有剩余现金，把剩余现金计入账户市值
     for idx, row in merged_df.iterrows():
         stock_code = row['stock_code']
-        remaining = stock_to_remaining.get(stock_code, 0)
-        merged_df.at[idx, 'market_value'] += remaining
+        current_cash = row['current_cash']
+        merged_df.at[idx, 'market_value'] += current_cash
 
     # 根据账户市值和初始资金计算利润和利润率
     merged_df['profit'] = merged_df['market_value'] - merged_df['init_cash']
-    merged_df['profit_percent'] = ((merged_df['market_value'] - merged_df['init_cash']) / merged_df['init_cash']).round(2)
-    
+    merged_df['profit_percent'] = ( merged_df['profit'] / merged_df['init_cash']).round(2)
+
     # 添加编号列
     merged_df['no'] = range(1, len(merged_df) + 1)
-    
-    # 汇总数据
-    merged_df = merged_df[['no', 'stock_code', 'stock_name', 'init_cash', 'support_date', 'support_price', 'bought_date', 'cost_price', 'trade_date', 'trade_positions', 'holding_days', 'max_holding_days', 'market_value', 'profit', 'profit_percent']]
 
-    # 对汇总数据各字段值进行合并计算
-    total_init_cash = merged_df['init_cash'].sum()
-    total_market_value = merged_df['market_value'].sum()
+    # 重命名列为中文
+    merged_df = merged_df.rename(columns=PROFIT_LOSS_MAPPING)
+    # 按指定顺序重新排列列
+    merged_df = merged_df[[PROFIT_LOSS_MAPPING[col] for col in PROFIT_LOSS_ORDER]]
+
+    total_init_cash = merged_df[PROFIT_LOSS_MAPPING['init_cash']].sum()
+    total_market_value = merged_df[PROFIT_LOSS_MAPPING['market_value']].sum()
     total_profit_percent = ((total_market_value - total_init_cash) / total_init_cash).round(2)
+    
+    # 构造汇总行，使用中文列名
     total_row = pd.DataFrame({
-        'no': [None],
-        'stock_code': [None],
-        'stock_name': ['总初始资金'],
-        'init_cash': [total_init_cash],
-        'bought_date': [None],
-        'cost_price': [None],
-        'trade_date': [None],
-        'trade_positions': [None],
-        'holding_days': [None],
-        'max_holding_days': ['总市值'],
-        'market_value': [total_market_value],
-        'profit': [total_market_value - total_init_cash],
-        'profit_percent': [total_profit_percent]
+        PROFIT_LOSS_MAPPING['no']: [None],
+        PROFIT_LOSS_MAPPING['stock_code']: [None],
+        PROFIT_LOSS_MAPPING['stock_name']: ['总投资金额'],
+        PROFIT_LOSS_MAPPING['init_cash']: [total_init_cash],
+        PROFIT_LOSS_MAPPING['bought_date']: [None],
+        PROFIT_LOSS_MAPPING['total_shares']: [None],
+        PROFIT_LOSS_MAPPING['cost_price']: [None],
+        PROFIT_LOSS_MAPPING['trade_date']: [None],
+        PROFIT_LOSS_MAPPING['holding_days']: [None],
+        PROFIT_LOSS_MAPPING['max_holding_days']: ['总市值'],
+        PROFIT_LOSS_MAPPING['market_value']: [total_market_value],
+        PROFIT_LOSS_MAPPING['profit']: [total_market_value - total_init_cash],
+        PROFIT_LOSS_MAPPING['profit_percent']: [total_profit_percent]
     })
 
     # 准备导出数据
@@ -553,13 +574,12 @@ def do_back_test():
     for r in dataframe_to_rows(final_export_df, index=False, header=True):
         ws.append(r)
 
-    # 红的行表示赢利、绿的行表示亏损
+    # 红的行表示盈利、绿的行表示亏损
     red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
     green_fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
 
-    # 逐行导出数据
     for row in range(2, len(merged_df) + 2):
-        profit_pct = final_export_df.loc[row-2, 'profit_percent']
+        profit_pct = final_export_df.loc[row-2, PROFIT_LOSS_MAPPING['profit_percent']]
         if profit_pct > 0:
             for col in range(1, len(final_export_df.columns) + 1):
                 ws.cell(row=row, column=col).fill = red_fill
@@ -569,30 +589,29 @@ def do_back_test():
 
     col_map = {col: idx+1 for idx, col in enumerate(final_export_df.columns)}
     for row in range(2, ws.max_row + 1):
-        for date_col in ['bought_date', 'trade_date']:
+        for date_col in [PROFIT_LOSS_MAPPING['bought_date'], PROFIT_LOSS_MAPPING['trade_date']]:
             if date_col in col_map:
                 cell = ws.cell(row, col_map[date_col])
                 if cell.value is not None:
                     cell.number_format = 'yyyy-mm-dd'
         
-        for float_col in ['cost_price', 'market_value', 'profit']:
+        for float_col in [PROFIT_LOSS_MAPPING['cost_price'], PROFIT_LOSS_MAPPING['market_value'], PROFIT_LOSS_MAPPING['profit']]:
             if float_col in col_map:
                 cell = ws.cell(row, col_map[float_col])
                 if cell.value is not None:
                     cell.number_format = '0.00'
         
-        if 'profit_percent' in col_map:
-            cell = ws.cell(row, col_map['profit_percent'])
+        if PROFIT_LOSS_MAPPING['profit_percent'] in col_map:
+            cell = ws.cell(row, col_map[PROFIT_LOSS_MAPPING['profit_percent']])
             if cell.value is not None:
                 cell.number_format = '0.00%'
         
-        for int_col in ['init_cash', 'trade_positions', 'holding_days', 'max_holding_days']:
+        for int_col in [PROFIT_LOSS_MAPPING['init_cash'], PROFIT_LOSS_MAPPING['total_shares'], PROFIT_LOSS_MAPPING['holding_days'], PROFIT_LOSS_MAPPING['max_holding_days']]:
             if int_col in col_map:
                 cell = ws.cell(row, col_map[int_col])
                 if cell.value is not None:
                     cell.number_format = '0'
 
-    # 导出数据到excel文件
     wb.save(filename)
 
 if __name__ == '__main__':
