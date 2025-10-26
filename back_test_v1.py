@@ -362,13 +362,13 @@ def do_back_test():
                 holding = False
                 continue
             
-            # 跌破支撑线但未跌破止损线，3日收不上去清仓，跌破止损线立即清仓。（按收盘价卖）
+            # 跌破支撑线但未跌破止损线，3日收不上去清仓。（按收盘价卖）
             if current_low < support_price:
                 if current_close >= support_price:
                     recover_count = 0
                 else:
                     recover_count += 1
-                if recover_count >= 3:
+                if recover_count >= 4:
                     sell_price = current_close
                     update_position(
                         stock_code, stock_name, support_date, support_price, "sell", current_date,
@@ -380,7 +380,7 @@ def do_back_test():
                 recover_count = 0
             
             # Current rise
-            current_rise = current_close / cost_price
+            current_rise = current_high / cost_price
             
             # 涨幅达到10%时，卖出50%仓位（用的是成本价*1.1卖出）
             if not half_sold and current_rise >= 1.10:
@@ -398,12 +398,7 @@ def do_back_test():
             # 剩余 50% 仓位的动态跟踪策略
             if half_sold:
                 if current_rise > max_rise:
-                    if max_rise < 1.10 and current_rise >= 1.10:
-                        rise_break_date = current_date
-                        rise_count = 0
-                        max_rise = 1.10
-                        stop_loss = cost_price * 1.10
-                    elif max_rise < 1.20 and current_rise >= 1.20:
+                    if max_rise < 1.20 and current_rise >= 1.20:
                         rise_break_date = current_date
                         rise_count = 0
                         max_rise = 1.20
@@ -456,21 +451,21 @@ def do_back_test():
                         continue
                 
                 # 2.2 否则若突破130%后，5个交易日不超过140%清仓。（按收盘价卖）
-                if rise_break_date is not None:
-                    rise_count += 1  # 交易日计数
-                    next_level = max_rise + 0.10
-                    if rise_count >= 5 and current_rise < next_level:
-                        sell_price = current_close
-                        update_position(
-                            stock_code, stock_name, support_date, support_price, "sell", current_date,
-                            current_position, sell_price, current_close, holding_days
-                        )
-                        current_position = 0
-                        holding = False
-                        continue
+                # if rise_break_date is not None:
+                #     rise_count += 1  # 交易日计数
+                #     next_level = max_rise + 0.10
+                #     if rise_count >= 5 and current_rise < next_level:
+                #         sell_price = current_close
+                #         update_position(
+                #             stock_code, stock_name, support_date, support_price, "sell", current_date,
+                #             current_position, sell_price, current_close, holding_days
+                #         )
+                #         current_position = 0
+                #         holding = False
+                #         continue
                 
                 # 1. 回调至130%，立即卖出；（按130%价卖）
-                if current_low < stop_loss:
+                if current_close < stop_loss:
                     sell_price = stop_loss
                     update_position(
                         stock_code, stock_name, support_date, support_price, "sell", current_date,
