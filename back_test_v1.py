@@ -73,12 +73,18 @@ def load_target_df():
     convert_date_format_of_df_column(df=df)
 
     # 复制备注列为breakthrough_date
-    df['stock_code'] = df['代码'].str.lower()
-    df['stock_name'] = df['    名称']
-    df['trade_date'] = df['备注']
-    df['adj_stock_price'] = df['现价']
     df['breakthrough_date'] = df['备注']
-    return df
+    df['stock_code'] = df['代码'].str.lower()
+    stock_data_list = (
+        df.rename(columns={
+            '备注': 'trade_date',
+            '代码': 'stock_code',
+            '    名称': 'stock_name',
+            '现价': 'adj_stock_price'}
+        )[['trade_date', 'breakthrough_date', 'stock_code', 'stock_name', 'adj_stock_price']].to_dict(orient='records')
+    )
+    stock_data_df = pd.DataFrame(stock_data_list)
+    return stock_data_df
 
 # 根据选中的突破日股票数据(结构:[{"stock_code": "AAPL"},{"stock_code": "TSM"}])
 # 获取被选股票突破日后N天的交易数据
@@ -343,14 +349,14 @@ def get_next_N_days_data(stock_data_list, max_holding_days):
     return results_df
 
 
-def update_position(stock_code, stock_name, breakthrough_date, support_price, trade_type, trade_date, trade_positions, trade_price, close_price, holding_days):
+def update_position(stock_code, stock_name, support_date, support_price, trade_type, trade_date, trade_positions, trade_price, close_price, holding_days):
     global BACKTEST_RESULT, INITIAL_CASH, MAX_HOLDING_TRADING_DAYS
     if stock_code in BACKTEST_RESULT:
         stock_data = BACKTEST_RESULT[stock_code]
         stock_data["stock_code"] = stock_code
         stock_data["stock_name"] = stock_name
         stock_data["init_cash"] = INITIAL_CASH
-        stock_data["breakthrough_date"] = breakthrough_date
+        stock_data["support_date"] = support_date
         stock_data["support_price"] = support_price
         stock_data["max_holding_days"] = MAX_HOLDING_TRADING_DAYS
         stock_data["holding_days"] = holding_days
@@ -376,7 +382,7 @@ def update_position(stock_code, stock_name, breakthrough_date, support_price, tr
             stock_data["stock_code"] = stock_code
             stock_data["stock_name"] = stock_name
             stock_data["init_cash"] = INITIAL_CASH
-            stock_data["breakthrough_date"] = breakthrough_date
+            stock_data["support_date"] = support_date
             stock_data["support_price"] = support_price
             stock_data["max_holding_days"] = MAX_HOLDING_TRADING_DAYS
             stock_data["holding_days"] = holding_days
@@ -412,6 +418,7 @@ def do_back_test():
     for idx, target in target_df.iterrows():
         stock_code = target['stock_code']
         stock_name = target['stock_name']
+        support_date = target['trade_date']
         breakthrough_date = target['breakthrough_date']
         
         group = stock_df[stock_df['stock_code'] == stock_code].reset_index(drop=True)
@@ -437,7 +444,7 @@ def do_back_test():
         cost_morning = shares_morning * group.loc[bought_idx, 'open']
         # remaining_morning = cash_morning - cost_morning
         update_position(
-            stock_code, stock_name, breakthrough_date, support_price, "buy", bought_date,
+            stock_code, stock_name, support_date, support_price, "buy", bought_date,
             shares_morning, group.loc[bought_idx, 'open'], group.loc[bought_idx, 'close'], 1
         )
         
@@ -445,7 +452,7 @@ def do_back_test():
         cost_evening = shares_evening * group.loc[bought_idx, 'close']
         # remaining_evening = cash_evening - cost_evening
         update_position(
-            stock_code, stock_name, breakthrough_date, support_price, "buy", bought_date,
+            stock_code, stock_name, support_date, support_price, "buy", bought_date,
             shares_evening, group.loc[bought_idx, 'close'], group.loc[bought_idx, 'close'], 1
         )
         
@@ -496,7 +503,7 @@ def do_back_test():
                     current_date = group.loc[prev_i, 'trade_date']
                     holding_days -= 1  # 回退到前一天的交易日计数
                     update_position(
-                        stock_code, stock_name, breakthrough_date, support_price, "sell", current_date,
+                        stock_code, stock_name, support_date, support_price, "sell", current_date,
                         current_position, sell_price, current_close, holding_days
                     )
                     holding = False
@@ -506,7 +513,7 @@ def do_back_test():
             if current_low < stop_loss:
                 sell_price = stop_loss
                 update_position(
-                    stock_code, stock_name, breakthrough_date, support_price, "sell", current_date,
+                    stock_code, stock_name, support_date, support_price, "sell", current_date,
                     current_position, sell_price, current_close, holding_days
                 )
                 holding = False
@@ -521,7 +528,7 @@ def do_back_test():
                 if recover_count >= 4:
                     sell_price = current_close
                     update_position(
-                        stock_code, stock_name, breakthrough_date, support_price, "sell", current_date,
+                        stock_code, stock_name, support_date, support_price, "sell", current_date,
                         current_position, sell_price, current_close, holding_days
                     )
                     holding = False
@@ -538,7 +545,7 @@ def do_back_test():
                 current_position -= sell_position
                 sell_price = cost_price * 1.10
                 update_position(
-                    stock_code, stock_name, breakthrough_date, support_price, "sell", current_date,
+                    stock_code, stock_name, support_date, support_price, "sell", current_date,
                     sell_position, sell_price, current_close, holding_days
                 )
                 half_sold = True
@@ -593,7 +600,7 @@ def do_back_test():
                     if current_rise >= 2.00:
                         sell_price = cost_price * 2.00
                         update_position(
-                            stock_code, stock_name, breakthrough_date, support_price, "sell", current_date,
+                            stock_code, stock_name, support_date, support_price, "sell", current_date,
                             current_position, sell_price, current_close, holding_days
                         )
                         current_position = 0
@@ -607,7 +614,7 @@ def do_back_test():
                 #     if rise_count >= 5 and current_rise < next_level:
                 #         sell_price = current_close
                 #         update_position(
-                #             stock_code, stock_name, breakthrough_date, support_price, "sell", current_date,
+                #             stock_code, stock_name, support_date, support_price, "sell", current_date,
                 #             current_position, sell_price, current_close, holding_days
                 #         )
                 #         current_position = 0
@@ -618,7 +625,7 @@ def do_back_test():
                 if current_close < stop_loss:
                     sell_price = stop_loss
                     update_position(
-                        stock_code, stock_name, breakthrough_date, support_price, "sell", current_date,
+                        stock_code, stock_name, support_date, support_price, "sell", current_date,
                         current_position, sell_price, current_close, holding_days
                     )
                     current_position = 0
@@ -629,7 +636,7 @@ def do_back_test():
                 if max_rise >= current_rise and holding_days >= 40:
                     sell_price = current_close
                     update_position(
-                        stock_code, stock_name, breakthrough_date, support_price, "sell", current_date,
+                        stock_code, stock_name, support_date, support_price, "sell", current_date,
                         current_position, sell_price, current_close, holding_days
                     )
                     current_position = 0
@@ -640,7 +647,7 @@ def do_back_test():
             if i == len(group) - 1 and holding:
                 sell_price = current_close
                 update_position(
-                    stock_code, stock_name, breakthrough_date, support_price, "sell", current_date,
+                    stock_code, stock_name, support_date, support_price, "sell", current_date,
                     current_position, sell_price, current_close, holding_days
                 )
                 current_position = 0
@@ -656,7 +663,7 @@ def do_back_test():
         total_shares=('total_shares', 'max'),
         cost_price=('cost_price', 'max'),
         trade_date=('trade_date', 'max'),
-        support_date=('breakthrough_date', 'max'),
+        support_date=('support_date', 'max'),
         support_price=('support_price', 'max'),
         current_cash=('current_cash', 'sum'),
         holding_days=('holding_days', 'max'),
@@ -673,7 +680,7 @@ def do_back_test():
 
     # 根据账户市值和初始资金计算利润和利润率
     merged_df['profit'] = merged_df['market_value'] - merged_df['init_cash']
-    merged_df['profit_percent'] = ( merged_df['profit'] / merged_df['init_cash']).round(2)
+    merged_df['profit_percent'] = ( merged_df['profit'] / merged_df['init_cash'])
 
     # 添加编号列
     merged_df['no'] = range(1, len(merged_df) + 1)
@@ -685,7 +692,7 @@ def do_back_test():
 
     total_init_cash = merged_df[PROFIT_LOSS_MAPPING['init_cash']].sum()
     total_market_value = merged_df[PROFIT_LOSS_MAPPING['market_value']].sum()
-    total_profit_percent = ((total_market_value - total_init_cash) / total_init_cash).round(2)
+    total_profit_percent = ((total_market_value - total_init_cash) / total_init_cash)
     
     # 构造汇总行，使用中文列名
     total_row = pd.DataFrame({
