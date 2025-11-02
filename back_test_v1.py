@@ -359,9 +359,14 @@ def update_position(stock_code, stock_name, support_date, support_price, trade_t
         stock_data["support_date"] = support_date
         stock_data["support_price"] = support_price
         stock_data["max_holding_days"] = MAX_HOLDING_TRADING_DAYS
-        stock_data["holding_days"] = holding_days
         if trade_type == "sell":
-            stock_data["trade_date"] = max(trade_date, stock_data["trade_date"]) if "trade_date" in stock_data else trade_date
+            if holding_days == 1:
+                return
+            trade_date = max(trade_date, stock_data["trade_date"]) if "trade_date" in stock_data else trade_date
+            bought_date = stock_data["bought_date"]
+            # print(f"bought_date:{bought_date}, trade_date: {trade_date}, holding_days: {holding_days}")
+            stock_data["holding_days"] = holding_days
+            stock_data["trade_date"] = trade_date
             stock_data["current_positions"] = stock_data["current_positions"] - trade_positions
             stock_data["current_cash"] = stock_data["current_cash"] + (trade_price * trade_positions)
             stock_data["market_value"] = stock_data["current_positions"] * close_price
@@ -425,15 +430,18 @@ def do_back_test():
         if group.empty:
             continue
 
-        
         support_price = stock_df.loc[stock_df['stock_code'] == stock_code, 'adj_support_price'].iloc[0]
         
         # 找到突破日的后一日
         next_days = group[group['trade_date'] > breakthrough_date]
         if next_days.empty:
             continue
+
         bought_date = next_days['trade_date'].iloc[0]
         bought_idx = group[group['trade_date'] == bought_date].index[0]
+
+        # 初始化交易日计数
+        holding_days = 0
         
         # 买入策略：以开盘价买入50%， 以收盘价买入50%。按100的整数倍仓位进行购买，剩余按现金进行持有。
         initial_cash = INITIAL_CASH
@@ -445,7 +453,7 @@ def do_back_test():
         # remaining_morning = cash_morning - cost_morning
         update_position(
             stock_code, stock_name, support_date, support_price, "buy", bought_date,
-            shares_morning, group.loc[bought_idx, 'open'], group.loc[bought_idx, 'close'], 1
+            shares_morning, group.loc[bought_idx, 'open'], group.loc[bought_idx, 'close'], holding_days
         )
         
         shares_evening = ((cash_evening / group.loc[bought_idx, 'close']) // 100) * 100
@@ -453,7 +461,7 @@ def do_back_test():
         # remaining_evening = cash_evening - cost_evening
         update_position(
             stock_code, stock_name, support_date, support_price, "buy", bought_date,
-            shares_evening, group.loc[bought_idx, 'close'], group.loc[bought_idx, 'close'], 1
+            shares_evening, group.loc[bought_idx, 'close'], group.loc[bought_idx, 'close'], holding_days
         )
         
         total_shares = shares_morning + shares_evening
@@ -478,9 +486,6 @@ def do_back_test():
         max_rise = 1.0
         rise_break_date = None
         rise_count = 0
-        
-        # 初始化交易日计数
-        holding_days = 0
         
         for i in range(bought_idx, len(group)):
             if not holding:
