@@ -204,7 +204,6 @@ def optimize_and_query_stock_data_duckdb():
             t.industry_level3,
             -- ✅ 流通市值换算成“亿”
             (t.market_cap / 100000000) AS market_cap_of_100_million,
-            -- 
             (t.total_market_cap / 100000000) AS total_market_cap_of_100_million,
             -- ✅ N个交易日内（不含当日）的最高收盘价, 使用的是复权后的收盘价
             MAX(t.adj_close_price) OVER (
@@ -240,17 +239,17 @@ def optimize_and_query_stock_data_duckdb():
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS has_gain_5_percent,
             -- ✅ 支撑日
-            FIRST_VALUE(t.trade_date) OVER (
+            ARG_MAX(t.trade_date, t.adj_close_price) OVER (
                 PARTITION BY t.stock_code
                 ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS support_date,
             -- ✅ 支撑日收盘价
-            FIRST_VALUE(t.adj_close_price) OVER (
+            MAX(t.adj_close_price) OVER (
                 PARTITION BY t.stock_code
                 ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            ) AS suport_close_price,
+            ) AS support_close_price,
             -- ✅ 行号：确保窗口至少包含N个交易日
             ROW_NUMBER() OVER (
                 PARTITION BY t.stock_code
@@ -264,33 +263,12 @@ def optimize_and_query_stock_data_duckdb():
             -- ✅ 排除2022年1月1号之前的交易数据
             t.trade_date >= '{earliest_time_limit}'
     ),
-    StockWindowsWithDip AS (
-        SELECT
-            sw.*,
-            -- ✅ 回踩日：后 10 个交易日内第一个满足 low <= suport_close_price*1.01 的日期
-            FIRST_VALUE(
-                CASE WHEN sw.adj_low_price <= (sw.suport_close_price * 1.01) THEN sw.trade_date END
-            ) OVER (
-                PARTITION BY sw.stock_code
-                ORDER BY sw.trade_date
-                ROWS BETWEEN 1 FOLLOWING AND 10 FOLLOWING
-            ) AS dip_date,
-            -- ✅ 回踩价：对应的最低价
-            FIRST_VALUE(
-                CASE WHEN sw.adj_low_price <= (sw.suport_close_price * 1.01) THEN sw.adj_low_price END
-            ) OVER (
-                PARTITION BY sw.stock_code
-                ORDER BY sw.trade_date
-                ROWS BETWEEN 1 FOLLOWING AND 10 FOLLOWING
-            ) AS dip_price
-        FROM StockWindows sw
-    ),
-    FilteredStockData AS (
+    BreakoutDays AS (
         SELECT
             sw.stock_code,
             sw.stock_name,
-            sw.trade_date,
-            sw.adj_close_price,
+            sw.trade_date AS breakout_date,
+            sw.adj_close_price AS breakout_close,
             sw.max_close_n_days,
             sw.market_cap_of_100_million,
             sw.total_market_cap_of_100_million,
@@ -298,11 +276,9 @@ def optimize_and_query_stock_data_duckdb():
             sw.industry_level2,
             sw.industry_level3,
             sw.support_date,
-            sw.suport_close_price,
-            sw.dip_date,
-            sw.dip_price
-        FROM
-            StockWindowsWithDip AS sw
+            sw.support_close_price,
+            sw.rn
+        FROM StockWindows sw
         WHERE
             -- 📌 条件0：窗口内至少有N个交易日数据
             sw.rn > {history_trading_days}
@@ -331,6 +307,75 @@ def optimize_and_query_stock_data_duckdb():
             )
             -- 📌 条件4：流通市值在30亿至500亿之间
             AND sw.market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
+    ),
+    DipCandidates AS (
+        SELECT
+            b.stock_code,
+            b.breakout_date,
+            t.trade_date,
+            t.adj_low_price,
+            ROW_NUMBER() OVER (PARTITION BY b.stock_code, b.breakout_date ORDER BY t.trade_date) AS dip_seq
+        FROM BreakoutDays b
+        JOIN AdjustedStockData t
+          ON t.stock_code = b.stock_code
+         AND t.trade_date > b.breakout_date + INTERVAL '1 day'
+         AND t.trade_date <= b.breakout_date + INTERVAL '10 days'
+         AND b.support_close_price >= t.adj_low_price AND b.support_close_price <= t.adj_high_price
+    ),
+    DipWide AS (
+        SELECT
+            stock_code,
+            breakout_date,
+            MAX(CASE WHEN dip_seq = 1 THEN trade_date END) AS dip_date_1,
+            MAX(CASE WHEN dip_seq = 1 THEN adj_low_price END) AS dip_price_1,
+            MAX(CASE WHEN dip_seq = 2 THEN trade_date END) AS dip_date_2,
+            MAX(CASE WHEN dip_seq = 2 THEN adj_low_price END) AS dip_price_2,
+            MAX(CASE WHEN dip_seq = 3 THEN trade_date END) AS dip_date_3,
+            MAX(CASE WHEN dip_seq = 3 THEN adj_low_price END) AS dip_price_3,
+            MAX(CASE WHEN dip_seq = 4 THEN trade_date END) AS dip_date_4,
+            MAX(CASE WHEN dip_seq = 4 THEN adj_low_price END) AS dip_price_4,
+            MAX(CASE WHEN dip_seq = 5 THEN trade_date END) AS dip_date_5,
+            MAX(CASE WHEN dip_seq = 5 THEN adj_low_price END) AS dip_price_5,
+            MAX(CASE WHEN dip_seq = 6 THEN trade_date END) AS dip_date_6,
+            MAX(CASE WHEN dip_seq = 6 THEN adj_low_price END) AS dip_price_6,
+            MAX(CASE WHEN dip_seq = 7 THEN trade_date END) AS dip_date_7,
+            MAX(CASE WHEN dip_seq = 7 THEN adj_low_price END) AS dip_price_7,
+            MAX(CASE WHEN dip_seq = 8 THEN trade_date END) AS dip_date_8,
+            MAX(CASE WHEN dip_seq = 8 THEN adj_low_price END) AS dip_price_8,
+            MAX(CASE WHEN dip_seq = 9 THEN trade_date END) AS dip_date_9,
+            MAX(CASE WHEN dip_seq = 9 THEN adj_low_price END) AS dip_price_9
+        FROM DipCandidates
+        GROUP BY stock_code, breakout_date
+    ),
+    FilteredStockDataWithDip AS (
+        SELECT
+            b.stock_code,
+            b.stock_name,
+            b.breakout_date AS trade_date,
+            b.breakout_close AS adj_close_price,
+            b.max_close_n_days,
+            b.market_cap_of_100_million,
+            b.total_market_cap_of_100_million,
+            b.industry_level1,
+            b.industry_level2,
+            b.industry_level3,
+            b.support_date,
+            b.support_close_price,
+            d.dip_date_1, d.dip_price_1,
+            d.dip_date_2, d.dip_price_2,
+            d.dip_date_3, d.dip_price_3,
+            d.dip_date_4, d.dip_price_4,
+            d.dip_date_5, d.dip_price_5,
+            d.dip_date_6, d.dip_price_6,
+            d.dip_date_7, d.dip_price_7,
+            d.dip_date_8, d.dip_price_8,
+            d.dip_date_9, d.dip_price_9
+        FROM BreakoutDays b
+        LEFT JOIN DipWide d
+          ON b.stock_code = d.stock_code AND b.breakout_date = d.breakout_date
+    ),
+    FilteredStockData AS (
+        SELECT * FROM FilteredStockDataWithDip
     ),
     DeduplicatedFinanceData AS (
         -- ✅ 去掉 stock_finance_data 中完全重复的行, R_np: 报告净利润(Reported Net Profit), R_operating_total_revenue: 报告营业总收入(Reported Operating Total Revenue)
@@ -415,9 +460,16 @@ def optimize_and_query_stock_data_duckdb():
             s.industry_level2,
             s.industry_level3,
             s.support_date,
-            s.suport_close_price,
-            s.dip_date,
-            s.dip_price,
+            s.support_close_price,
+            s.dip_date_1, s.dip_price_1,
+            s.dip_date_2, s.dip_price_2,
+            s.dip_date_3, s.dip_price_3,
+            s.dip_date_4, s.dip_price_4,
+            s.dip_date_5, s.dip_price_5,
+            s.dip_date_6, s.dip_price_6,
+            s.dip_date_7, s.dip_price_7,
+            s.dip_date_8, s.dip_price_8,
+            s.dip_date_9, s.dip_price_9,
             CASE WHEN f.latest_R_np IS NOT NULL 
                 THEN f.latest_R_np / 100000000 
                 ELSE NULL
@@ -428,8 +480,7 @@ def optimize_and_query_stock_data_duckdb():
             END AS latest_R_operating_total_revenue,
             f.net_profit_yoy,
             f.revenue_yoy
-        FROM
-            FilteredStockData s
+        FROM FilteredStockData s
         LEFT JOIN NetProfitAndRevenueYoy f 
             ON f.stock_code = s.stock_code 
             AND f.trade_date = s.trade_date
@@ -439,11 +490,18 @@ def optimize_and_query_stock_data_duckdb():
         stock_code AS 股票代码,
         stock_name AS 股票名称,
         support_date AS 支撑日期,
-        ROUND(suport_close_price, 2) AS 支撑日_收盘价,
+        ROUND(support_close_price, 2) AS 支撑日_收盘价,
         trade_date AS 突破日期,
         ROUND(adj_close_price, 2) AS 突破日_收盘价,
-        dip_date AS 回踩日,
-        ROUND(dip_price, 2) AS 回踩日_最低价,
+        dip_date_1 AS 回踩日1, ROUND(dip_price_1, 2) AS 回踩价1,
+        dip_date_2 AS 回踩日2, ROUND(dip_price_2, 2) AS 回踩价2,
+        dip_date_3 AS 回踩日3, ROUND(dip_price_3, 2) AS 回踩价3,
+        dip_date_4 AS 回踩日4, ROUND(dip_price_4, 2) AS 回踩价4,
+        dip_date_5 AS 回踩日5, ROUND(dip_price_5, 2) AS 回踩价5,
+        dip_date_6 AS 回踩日6, ROUND(dip_price_6, 2) AS 回踩价6,
+        dip_date_7 AS 回踩日7, ROUND(dip_price_7, 2) AS 回踩价7,
+        dip_date_8 AS 回踩日8, ROUND(dip_price_8, 2) AS 回踩价8,
+        dip_date_9 AS 回踩日9, ROUND(dip_price_9, 2) AS 回踩价9,
         ROUND(market_cap_of_100_million, 2) AS "流市值(亿)",
         ROUND(total_market_cap_of_100_million, 2) AS "总市值(亿)",
         ROUND(latest_R_np, 2) "季净利润(亿)",
@@ -464,11 +522,18 @@ def optimize_and_query_stock_data_duckdb():
         stock_code AS 股票代码,
         stock_name AS 股票名称,
         support_date AS 支撑日期,
-        ROUND(suport_close_price, 2) AS 支撑日_收盘价,
+        ROUND(support_close_price, 2) AS 支撑日_收盘价,
         trade_date AS 突破日期,
         ROUND(adj_close_price, 2) AS 突破日_收盘价,
-        dip_date AS 回踩日,
-        ROUND(dip_price, 2) AS 回踩日_最低价,
+        dip_date_1 AS 回踩日1, ROUND(dip_price_1, 2) AS 回踩价1,
+        dip_date_2 AS 回踩日2, ROUND(dip_price_2, 2) AS 回踩价2,
+        dip_date_3 AS 回踩日3, ROUND(dip_price_3, 2) AS 回踩价3,
+        dip_date_4 AS 回踩日4, ROUND(dip_price_4, 2) AS 回踩价4,
+        dip_date_5 AS 回踩日5, ROUND(dip_price_5, 2) AS 回踩价5,
+        dip_date_6 AS 回踩日6, ROUND(dip_price_6, 2) AS 回踩价6,
+        dip_date_7 AS 回踩日7, ROUND(dip_price_7, 2) AS 回踩价7,
+        dip_date_8 AS 回踩日8, ROUND(dip_price_8, 2) AS 回踩价8,
+        dip_date_9 AS 回踩日9, ROUND(dip_price_9, 2) AS 回踩价9,
         ROUND(market_cap_of_100_million, 2) AS "流市值(亿)",
         ROUND(total_market_cap_of_100_million, 2) AS "总市值(亿)",
         ROUND(latest_R_np, 2) "季净利润(亿)",
@@ -483,14 +548,7 @@ def optimize_and_query_stock_data_duckdb():
     ORDER BY 股票代码, 突破日期;
     """
 
-    # # 调试代码
-    # print(f"SQL: {query_sql}")
-    # return
-
     print("\n---------- 分析查询计划 (DuckDB) -------")
-    # DuckDB provides 'EXPLAIN' for query plans
-    # query_plan = con.execute("EXPLAIN " + query_sql).fetchall()
-    # print(query_plan)
     print("--------------------------------------\n")
 
     print("\n执行筛选...")
@@ -498,23 +556,16 @@ def optimize_and_query_stock_data_duckdb():
     results_df = con.execute(query_sql).fetchdf() # Fetch results directly as a Pandas DataFrame
     
 
-    # 确保 trade_date 是 datetime 格式
-    # results_df['trade_date'] = pd.to_datetime(results_df['trade_date'])
     # 按 stock_code 和 trade_date 升序排序
     results_df = results_df.sort_values(['股票代码', '突破日期'], ascending=[True, True]).reset_index(drop=True)
 
     if use_cond_1_1_or_cond_1_2 == "1.1":
-        # 📌 条件1.1: 次高收盘价为前一个交易日收盘价的不作为筛选结果
-        # 按 stock_code 分组并添加删除标记
         results_df = apply_mark_records(results_df)
-        # 📌 确保 delete_flag 存在
         if 'delete_flag' not in results_df.columns:
             results_df['delete_flag'] = 0
-        # 删除标记为“删除”的记录
         results_df = results_df[results_df['delete_flag'] == 0].drop(columns='delete_flag').reset_index(drop=True)
 
     if use_cond_1_1_or_cond_1_2 == "1.2":
-        # 📌 条件1.2: 筛选结果后20个交易日内筛选出的日期不作为筛选结果
         results_df = results_df.groupby('股票代码', group_keys=False).apply(filter_records).reset_index(drop=True)
 
     end_time = time.time()
@@ -523,14 +574,8 @@ def optimize_and_query_stock_data_duckdb():
     if not results_df.empty:
         num_results = len(results_df)
         print(f"\n筛选到 {num_results} 条股票及交易日期数据:")
-        # # 如果筛选到的记录数小于50，则直接打印
-        # print(results_df.head(50).to_string())
-        # new_df = results_df[results_df['股票名称'] == '招商南油'].copy()
-        # print(new_df.to_string())
         if num_results > 50:
-            # 否则导入到查询结果文件choose_result.csv文件中
             print("...")
-            # Export to CSV with UTF-8 BOM encoding
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             if use_cond_1_1_or_cond_1_2 == '1.2':
                 filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2_cond1.2_{range_days_of_cond_1_2}days_{apply_cond5_or_not}_cond5"
@@ -550,5 +595,4 @@ def optimize_and_query_stock_data_duckdb():
     con.close()
 
 if __name__ == '__main__':
-    # Call the function to run the optimization and query
     optimize_and_query_stock_data_duckdb()
