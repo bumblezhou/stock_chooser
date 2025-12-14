@@ -3,90 +3,57 @@ import pandas as pd
 from packaging import version
 from datetime import datetime, timedelta
 import time # Import time module for timing
+from typing import List, Dict, Union
 import configparser
 
-# 计算工作日间隔
-def calculate_workday_diff(dates):
-    dates = dates.values
-    return pd.Series([float('inf')] + [len(pd.date_range(start=dates[i-1], end=dates[i], freq='B')) - 1 for i in range(1, len(dates))])
+# 定义时间窗口和回踩条件
+HISTORY_DAYS = 40  # 支撑价向前看的天数
+FUTURE_DAYS = 40   # 回踩日向后看的天数
+VOLATILITY_LIMIT = 0.05  # 回踩日波动性限制（C条件）
+SUPPORT_PRICE_TOLERANCE = 0.995 # 回踩日最低价要包含支持价的比例（A条件）
 
-# 筛选函数：筛选结果后N个交易日内筛选出的日期不作为筛选结果。
-def filter_records(group):
-    # 创建 ConfigParser 对象
-    config = configparser.ConfigParser()
-    config.read('./config.conf')
-    range_days_of_cond_1_2=config['settings']['range_days_of_cond_1_2']         # 使用条件1.2时，其后N个交易日设定值
-    range_days_of_cond_1_2=int(range_days_of_cond_1_2)
+# 加载需要做回测运算的xlsx文件
+def load_df_from_excel_file(file_path):
+    df = None
+    try:
+        # 读取 Excel 文件的第一个工作表，第一行作为列名
+        df = pd.read_excel(file_path, sheet_name=0, engine='openpyxl', header=0)
+    except FileNotFoundError:
+        print(f"Error: File '{file_path}' not found")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+    return df
 
-    if len(group) <= 1:
-        return group
-    group = group.copy()
-    group['workday_diff'] = calculate_workday_diff(group['trade_date'])
-    keep = [True] * len(group)  # 初始化保留标志
-    last_kept_idx = 0  # 记录最后保留的记录索引
+# 把df中某列的值转换为datetime格式
+def convert_date_format_of_df_column(df, column_name="备注"):
+    try:
+        # 将“备注”列从 yyyyMMdd 转换为 yyyy-MM-dd
+        df[column_name] = pd.to_datetime(df[column_name], format='%Y%m%d').dt.strftime('%Y-%m-%d')
+        return df
+    except Exception as e:
+        print(f"Error converting dates in column '{column_name}': {str(e)}")
+        return df
 
-    # 从第二条记录开始检查
-    for i in range(1, len(group)):
-        # 计算当前记录与最后保留记录的间隔
-        workday_diff = len(pd.date_range(start=group.iloc[last_kept_idx]['trade_date'], end=group.iloc[i]['trade_date'], freq='B')) - 1
-        if workday_diff <= range_days_of_cond_1_2:
-            # 如果间隔≤20，删除最后保留的记录和当前记录
-            keep[last_kept_idx] = False
-            keep[i] = False
-        else:
-            # 保留当前记录，更新最后保留的索引
-            last_kept_idx = i
+def load_target_df(excel_file_path: str):
+    df = load_df_from_excel_file(excel_file_path)
+    convert_date_format_of_df_column(df=df)
 
-    # 确保第一条记录保留
-    keep[0] = True
-    return group[keep].drop(columns='workday_diff')
+    # 复制备注列为breakthrough_date
+    df['breakthrough_date'] = df['备注']
+    df['stock_code'] = df['代码'].str.lower()
+    stock_data_list = (
+        df.rename(columns={
+            '备注': 'breakthrough_date',
+            '代码': 'stock_code',
+            '    名称': 'stock_name',
+            '现价': 'adj_stock_price'}
+        )[['breakthrough_date', 'stock_code', 'stock_name', 'adj_stock_price']].to_dict(orient='records')
+    )
+    stock_data_df = pd.DataFrame(stock_data_list)
+    return stock_data_df
 
-# 筛选函数：次高收盘价为前一个交易日收盘价的不作为筛选结果。
-def mark_records(group):
-    group = group.copy()
-    # 初始化标记列，0 表示保留，1 表示删除
-    group['delete_flag'] = 0
-
-    pd_version = pd.__version__
-    if version.parse(pd_version) < version.parse("2.1.0"):
-        # 手动加回股票代码
-        group['股票代码'] = group.name
-
-    if len(group) <= 1:
-        return group
-
-    # 计算相邻记录的工作日间隔和价格差异
-    dates = group['突破日期'].values
-    prices = group['突破日_收盘价'].values
-    for i in range(1, len(group)):
-        # 计算工作日间隔（忽略周末）
-        workday_diff = len(pd.date_range(start=dates[i-1], end=dates[i], freq='B')) - 1
-        # 如果间隔为1个工作日且后一条记录的 突破日_收盘价 大于前一条
-        if workday_diff == 1 and prices[i] > prices[i-1]:
-            group.iloc[i, group.columns.get_loc('delete_flag')] = 1
-    return group
-
-def apply_mark_records(results_df):
-    """
-    自动适配 pandas 版本，避免 groupby.apply 的 DeprecationWarning 或 TypeError
-    """
-    pd_version = pd.__version__
-
-    if version.parse(pd_version) >= version.parse("2.1.0"):
-        # ✅ pandas 2.1+：在 apply 里传 include_groups
-        results_df = results_df.groupby('股票代码', group_keys=False).apply(
-            mark_records, include_groups=True
-        )
-    else:
-        # ✅ pandas 旧版本
-        results_df = results_df.groupby('股票代码', group_keys=False).apply(
-            mark_records
-        ).reset_index(drop=True)
-
-    return results_df
-
-# 从库中筛选符合条件的记录，处理后导出到结果csv文件。
-def optimize_and_query_stock_data_duckdb():
+# 从库中找出复权计算过的数据。
+def get_next_N_days_data(stock_data_list, max_holding_days):
     """
     Connects to DuckDB, creates/ensures stock_data table exists (for testing),
     and queries stocks satisfying specific conditions using DuckDB.
@@ -132,10 +99,9 @@ def optimize_and_query_stock_data_duckdb():
     # or uncomment the data generation part below for testing.
     con = duckdb.connect(database='stock_data.duckdb', read_only=False)
     print("连接到数据库: stock_data.duckdb")
-            
-    # 查询库中的数据条数
-    result = con.execute("SELECT COUNT(*) FROM stock_data;").fetchone()
-    print(f"数据库中有{result[0]}条记录。")
+    
+    stock_code_list = ", ".join(f"'{item['stock_code']}'" for item in stock_data_list)
+    days_limit = 41 if max_holding_days is None else (int(max_holding_days) + 1)
 
     # Main Query SQL (optimized for DuckDB)
     # The SQL is mostly the same as DuckDB handles window functions efficiently.
@@ -143,7 +109,13 @@ def optimize_and_query_stock_data_duckdb():
     -- 📝 计算符合条件的股票交易日窗口
     WITH DeduplicatedStockData AS (
         -- ✅ 去掉 stock_data 中完全重复的行
-        SELECT DISTINCT stock_code, stock_name, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap, total_market_cap, industry_level1, industry_level2, industry_level3 FROM stock_data
+        SELECT DISTINCT stock_code, stock_name, trade_date, open_price, close_price, high_price, low_price, prev_close_price, market_cap, total_market_cap, industry_level1, industry_level2, industry_level3 
+        FROM stock_data
+        -- 🔧 限定 stock_code 范围，只查询给定股票列表
+        WHERE stock_code IN (
+            -- ⚠️ 这里的 stock_code_list 可以是 Python 格式 ['AAPL','TSM'] 转换成 SQL 字符串 'AAPL','TSM'
+            {stock_code_list}
+        )
     ),
     StockWithRiseFall AS (
         -- ✅ 计算复权涨跌幅，公式: 复权涨跌幅 = 收盘价 / 前收盘价 - 1
@@ -204,6 +176,7 @@ def optimize_and_query_stock_data_duckdb():
             t.industry_level3,
             -- ✅ 流通市值换算成“亿”
             (t.market_cap / 100000000) AS market_cap_of_100_million,
+            -- 
             (t.total_market_cap / 100000000) AS total_market_cap_of_100_million,
             -- ✅ N个交易日内（不含当日）的最高收盘价, 使用的是复权后的收盘价
             MAX(t.adj_close_price) OVER (
@@ -211,6 +184,12 @@ def optimize_and_query_stock_data_duckdb():
                 ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS max_close_n_days,
+            -- ✅ 对应的最高收盘价日期
+            arg_max(t.trade_date, t.adj_close_price) OVER (
+                PARTITION BY t.stock_code
+                ORDER BY t.trade_date
+                ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
+            ) AS max_close_n_days_date,
             -- ✅ N个交易日窗口内（不含当日）的最高价（用于振幅计算）, 使用的是复权后的最高价
             MAX(t.adj_high_price) OVER (
                 PARTITION BY t.stock_code
@@ -238,18 +217,6 @@ def optimize_and_query_stock_data_duckdb():
                 ORDER BY t.trade_date
                 ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
             ) AS has_gain_5_percent,
-            -- ✅ 支撑日
-            ARG_MAX(t.trade_date, t.adj_close_price) OVER (
-                PARTITION BY t.stock_code
-                ORDER BY t.trade_date
-                ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            ) AS support_date,
-            -- ✅ 支撑日收盘价
-            MAX(t.adj_close_price) OVER (
-                PARTITION BY t.stock_code
-                ORDER BY t.trade_date
-                ROWS BETWEEN {history_trading_days} PRECEDING AND 1 PRECEDING
-            ) AS support_close_price,
             -- ✅ 行号：确保窗口至少包含N个交易日
             ROW_NUMBER() OVER (
                 PARTITION BY t.stock_code
@@ -263,22 +230,24 @@ def optimize_and_query_stock_data_duckdb():
             -- ✅ 排除2022年1月1号之前的交易数据
             t.trade_date >= '{earliest_time_limit}'
     ),
-    BreakoutDays AS (
+    FilteredStockData AS (
         SELECT
             sw.stock_code,
             sw.stock_name,
-            sw.trade_date AS breakout_date,
-            sw.adj_close_price AS breakout_close,
+            sw.trade_date,
+            sw.adj_close_price,
+            sw.adj_high_price,
+            sw.adj_low_price,
+            sw.adj_open_price,
             sw.max_close_n_days,
+            sw.max_close_n_days_date,
             sw.market_cap_of_100_million,
             sw.total_market_cap_of_100_million,
             sw.industry_level1,
             sw.industry_level2,
-            sw.industry_level3,
-            sw.support_date,
-            sw.support_close_price,
-            sw.rn
-        FROM StockWindows sw
+            sw.industry_level3
+        FROM
+            StockWindows AS sw
         WHERE
             -- 📌 条件0：窗口内至少有N个交易日数据
             sw.rn > {history_trading_days}
@@ -308,291 +277,195 @@ def optimize_and_query_stock_data_duckdb():
             -- 📌 条件4：流通市值在30亿至500亿之间
             AND sw.market_cap_of_100_million BETWEEN {min_market_capitalization} AND {max_market_capitalization}
     ),
-    DipCandidates AS (
-        SELECT
-            b.stock_code,
-            b.breakout_date,
-            t.trade_date,
-            t.adj_low_price,
-            ROW_NUMBER() OVER (PARTITION BY b.stock_code, b.breakout_date ORDER BY t.trade_date) AS dip_seq
-        FROM BreakoutDays b
-        JOIN AdjustedStockData t
-          ON t.stock_code = b.stock_code
-         AND t.trade_date > b.breakout_date + INTERVAL '1 day'
-         AND t.trade_date <= b.breakout_date + INTERVAL '10 days'
-         AND b.support_close_price >= t.adj_low_price AND b.support_close_price <= t.adj_high_price
-    ),
-    DipWide AS (
-        SELECT
-            stock_code,
-            breakout_date,
-            MAX(CASE WHEN dip_seq = 1 THEN trade_date END) AS dip_date_1,
-            MAX(CASE WHEN dip_seq = 1 THEN adj_low_price END) AS dip_price_1,
-            MAX(CASE WHEN dip_seq = 2 THEN trade_date END) AS dip_date_2,
-            MAX(CASE WHEN dip_seq = 2 THEN adj_low_price END) AS dip_price_2,
-            MAX(CASE WHEN dip_seq = 3 THEN trade_date END) AS dip_date_3,
-            MAX(CASE WHEN dip_seq = 3 THEN adj_low_price END) AS dip_price_3,
-            MAX(CASE WHEN dip_seq = 4 THEN trade_date END) AS dip_date_4,
-            MAX(CASE WHEN dip_seq = 4 THEN adj_low_price END) AS dip_price_4,
-            MAX(CASE WHEN dip_seq = 5 THEN trade_date END) AS dip_date_5,
-            MAX(CASE WHEN dip_seq = 5 THEN adj_low_price END) AS dip_price_5,
-            MAX(CASE WHEN dip_seq = 6 THEN trade_date END) AS dip_date_6,
-            MAX(CASE WHEN dip_seq = 6 THEN adj_low_price END) AS dip_price_6,
-            MAX(CASE WHEN dip_seq = 7 THEN trade_date END) AS dip_date_7,
-            MAX(CASE WHEN dip_seq = 7 THEN adj_low_price END) AS dip_price_7,
-            MAX(CASE WHEN dip_seq = 8 THEN trade_date END) AS dip_date_8,
-            MAX(CASE WHEN dip_seq = 8 THEN adj_low_price END) AS dip_price_8,
-            MAX(CASE WHEN dip_seq = 9 THEN trade_date END) AS dip_date_9,
-            MAX(CASE WHEN dip_seq = 9 THEN adj_low_price END) AS dip_price_9
-        FROM DipCandidates
-        GROUP BY stock_code, breakout_date
-    ),
-    FilteredStockDataWithDip AS (
-        SELECT
-            b.stock_code,
-            b.stock_name,
-            b.breakout_date AS trade_date,
-            b.breakout_close AS adj_close_price,
-            b.max_close_n_days,
-            b.market_cap_of_100_million,
-            b.total_market_cap_of_100_million,
-            b.industry_level1,
-            b.industry_level2,
-            b.industry_level3,
-            b.support_date,
-            b.support_close_price,
-            d.dip_date_1, d.dip_price_1,
-            d.dip_date_2, d.dip_price_2,
-            d.dip_date_3, d.dip_price_3,
-            d.dip_date_4, d.dip_price_4,
-            d.dip_date_5, d.dip_price_5,
-            d.dip_date_6, d.dip_price_6,
-            d.dip_date_7, d.dip_price_7,
-            d.dip_date_8, d.dip_price_8,
-            d.dip_date_9, d.dip_price_9
-        FROM BreakoutDays b
-        LEFT JOIN DipWide d
-          ON b.stock_code = d.stock_code AND b.breakout_date = d.breakout_date
-    ),
-    FilteredStockData AS (
-        SELECT * FROM FilteredStockDataWithDip
-    ),
-    DeduplicatedFinanceData AS (
-        -- ✅ 去掉 stock_finance_data 中完全重复的行, R_np: 报告净利润(Reported Net Profit), R_operating_total_revenue: 报告营业总收入(Reported Operating Total Revenue)
-        SELECT DISTINCT stock_code, report_date, R_np, R_operating_total_revenue FROM stock_finance_data
-        WHERE
-            -- ✅ 排除北交所股票
-            stock_code NOT LIKE 'bj%'
-            -- ✅ 排除2022年1月1号之前的交易数据
-            AND STRPTIME(report_date, '%Y%m%d') >= STRPTIME('{earliest_time_limit}', '%Y-%m-%d %H:%M:%S')
-    ),
-    LatestFinanceData AS (
-        -- 步骤 1: 为每个 stock_code 和 trade_date 找到最近的 stock_finance_data 记录
-        SELECT
-            s.stock_code,
-            s.trade_date,
-            MAX(f.report_date) AS latest_report_date
-        FROM FilteredStockData s
-        LEFT JOIN DeduplicatedFinanceData f
-            ON s.stock_code = f.stock_code
-            AND STRPTIME(f.report_date, '%Y%m%d') <= s.trade_date
-            AND STRPTIME(f.report_date, '%Y%m%d') >= STRPTIME('{earliest_time_limit}', '%Y-%m-%d %H:%M:%S')
-        GROUP BY s.stock_code, s.trade_date
-    ),
-    FinanceRecords AS (
-        -- 步骤 2 & 3: 获取最近财务记录的详细信息并找到去年同期的财务记录（去年同一季度）
-        SELECT 
-            l.stock_code,
-            l.trade_date,
-            l.latest_report_date,
-            f1.R_np AS latest_R_np,
-            f1.R_operating_total_revenue AS latest_R_operating_total_revenue,
-            CAST(
-                (CAST(SUBSTR(l.latest_report_date, 1, 4) AS INTEGER) - 1) || SUBSTR(l.latest_report_date, 5, 4) AS VARCHAR
-            ) AS last_year_report_date,
-            f2.R_np AS last_year_R_np,
-            f2.R_operating_total_revenue AS last_year_R_operating_total_revenue
-        FROM LatestFinanceData l
-        LEFT JOIN DeduplicatedFinanceData f1
-            ON l.stock_code = f1.stock_code
-            AND f1.report_date = l.latest_report_date
-        LEFT JOIN DeduplicatedFinanceData f2
-            ON l.stock_code = f2.stock_code
-            AND f2.report_date = CAST(
-                (CAST(SUBSTR(l.latest_report_date, 1, 4) AS INTEGER) - 1) || SUBSTR(l.latest_report_date, 5, 4) AS VARCHAR
-            )
-    ),
-    NetProfitAndRevenueYoy AS (
-        -- 步骤 4: 计算同比增长率
-        SELECT 
-            stock_code,
-            trade_date,
-            latest_report_date,
-            latest_R_np,
-            latest_R_operating_total_revenue,
-            last_year_report_date,
-            last_year_R_np,
-            last_year_R_operating_total_revenue,
-            -- 净利润同比增长率
-            CASE 
-                WHEN last_year_R_np IS NOT NULL AND last_year_R_np != 0
-                THEN ROUND((latest_R_np - last_year_R_np) / last_year_R_np * 100, 2)
-                ELSE NULL
-            END AS net_profit_yoy,
-            -- 营业总收入同比增长率
-            CASE 
-                WHEN last_year_R_operating_total_revenue IS NOT NULL AND last_year_R_operating_total_revenue != 0
-                THEN ROUND((latest_R_operating_total_revenue - last_year_R_operating_total_revenue) / last_year_R_operating_total_revenue * 100, 2)
-                ELSE NULL
-            END AS revenue_yoy
-        FROM FinanceRecords
-    ),
-    FilteredStockDataWithFinanceData AS (
-        SELECT
-            s.stock_code,
-            s.stock_name,
-            s.trade_date,
-            s.adj_close_price,
-            s.max_close_n_days,
-            s.market_cap_of_100_million,
-            s.total_market_cap_of_100_million,
-            s.industry_level1,
-            s.industry_level2,
-            s.industry_level3,
-            s.support_date,
-            s.support_close_price,
-            s.dip_date_1, s.dip_price_1,
-            s.dip_date_2, s.dip_price_2,
-            s.dip_date_3, s.dip_price_3,
-            s.dip_date_4, s.dip_price_4,
-            s.dip_date_5, s.dip_price_5,
-            s.dip_date_6, s.dip_price_6,
-            s.dip_date_7, s.dip_price_7,
-            s.dip_date_8, s.dip_price_8,
-            s.dip_date_9, s.dip_price_9,
-            CASE WHEN f.latest_R_np IS NOT NULL 
-                THEN f.latest_R_np / 100000000 
-                ELSE NULL
-            END AS latest_R_np,
-            CASE WHEN f.latest_R_operating_total_revenue IS NOT NULL 
-                THEN f.latest_R_operating_total_revenue / 100000000 
-                ELSE NULL
-            END AS latest_R_operating_total_revenue,
-            f.net_profit_yoy,
-            f.revenue_yoy
-        FROM FilteredStockData s
-        LEFT JOIN NetProfitAndRevenueYoy f 
-            ON f.stock_code = s.stock_code 
-            AND f.trade_date = s.trade_date
+    LimitedRangeStockData AS (
+        -- 🔧 限定范围：每支股票从其 max_close_n_days_date 起，往后取 {days_limit} 个交易日数据
+        SELECT *
+        FROM StockWindows w
+        WHERE EXISTS (
+            SELECT 1
+            FROM FilteredStockData f
+            WHERE f.stock_code = w.stock_code
+            AND w.trade_date BETWEEN f.max_close_n_days_date AND DATE_ADD(f.max_close_n_days_date, INTERVAL {days_limit} DAY)
+        )
     )
     -- ✅ 最终输出
     SELECT
-        stock_code AS 股票代码,
-        stock_name AS 股票名称,
-        support_date AS 支撑日期,
-        ROUND(support_close_price, 2) AS 支撑日_收盘价,
-        trade_date AS 突破日期,
-        ROUND(adj_close_price, 2) AS 突破日_收盘价,
-        dip_date_1 AS 回踩日1, ROUND(dip_price_1, 2) AS 回踩价1,
-        dip_date_2 AS 回踩日2, ROUND(dip_price_2, 2) AS 回踩价2,
-        dip_date_3 AS 回踩日3, ROUND(dip_price_3, 2) AS 回踩价3,
-        dip_date_4 AS 回踩日4, ROUND(dip_price_4, 2) AS 回踩价4,
-        dip_date_5 AS 回踩日5, ROUND(dip_price_5, 2) AS 回踩价5,
-        dip_date_6 AS 回踩日6, ROUND(dip_price_6, 2) AS 回踩价6,
-        dip_date_7 AS 回踩日7, ROUND(dip_price_7, 2) AS 回踩价7,
-        dip_date_8 AS 回踩日8, ROUND(dip_price_8, 2) AS 回踩价8,
-        dip_date_9 AS 回踩日9, ROUND(dip_price_9, 2) AS 回踩价9,
-        ROUND(market_cap_of_100_million, 2) AS "流市值(亿)",
-        ROUND(total_market_cap_of_100_million, 2) AS "总市值(亿)",
-        ROUND(latest_R_np, 2) "季净利润(亿)",
-        ROUND(latest_R_operating_total_revenue, 2) "季总营收(亿)",
-        ROUND(net_profit_yoy, 2) AS 净利润同比增长率,
-        ROUND(revenue_yoy, 2) AS 营收同比增长率,
-        industry_level1 AS 所属领域1,
-        industry_level2 AS 所属领域2,
-        industry_level3 AS 所属领域3
-    FROM FilteredStockDataWithFinanceData
-    WHERE '{apply_cond5_or_not}' = 'yes' 
-        AND net_profit_yoy IS NOT NULL 
-        AND revenue_yoy IS NOT NULL 
-        -- 📌 条件5：最近一个财报周期净利润同比增长率和营业总收入同比增长率大于等于-20%
-        {cond5_sql_where_clause}
-    UNION ALL
-    SELECT
-        stock_code AS 股票代码,
-        stock_name AS 股票名称,
-        support_date AS 支撑日期,
-        ROUND(support_close_price, 2) AS 支撑日_收盘价,
-        trade_date AS 突破日期,
-        ROUND(adj_close_price, 2) AS 突破日_收盘价,
-        dip_date_1 AS 回踩日1, ROUND(dip_price_1, 2) AS 回踩价1,
-        dip_date_2 AS 回踩日2, ROUND(dip_price_2, 2) AS 回踩价2,
-        dip_date_3 AS 回踩日3, ROUND(dip_price_3, 2) AS 回踩价3,
-        dip_date_4 AS 回踩日4, ROUND(dip_price_4, 2) AS 回踩价4,
-        dip_date_5 AS 回踩日5, ROUND(dip_price_5, 2) AS 回踩价5,
-        dip_date_6 AS 回踩日6, ROUND(dip_price_6, 2) AS 回踩价6,
-        dip_date_7 AS 回踩日7, ROUND(dip_price_7, 2) AS 回踩价7,
-        dip_date_8 AS 回踩日8, ROUND(dip_price_8, 2) AS 回踩价8,
-        dip_date_9 AS 回踩日9, ROUND(dip_price_9, 2) AS 回踩价9,
-        ROUND(market_cap_of_100_million, 2) AS "流市值(亿)",
-        ROUND(total_market_cap_of_100_million, 2) AS "总市值(亿)",
-        ROUND(latest_R_np, 2) "季净利润(亿)",
-        ROUND(latest_R_operating_total_revenue, 2) "季总营收(亿)",
-        ROUND(net_profit_yoy, 2) AS 净利润同比增长率,
-        ROUND(revenue_yoy, 2) AS 营收同比增长率,
-        industry_level1 AS 所属领域1,
-        industry_level2 AS 所属领域2,
-        industry_level3 AS 所属领域3
-    FROM FilteredStockDataWithFinanceData
-    WHERE '{apply_cond5_or_not}' = 'no'
-    ORDER BY 股票代码, 突破日期;
+        stock_code,
+        stock_name,
+        trade_date,
+        max_close_n_days_date AS adj_support_date,
+        ROUND(max_close_n_days, 2) AS adj_support_price,
+        ROUND(adj_close_price, 2) AS adj_close_price,
+        ROUND(adj_high_price, 2) AS adj_high_price,
+        ROUND(adj_low_price, 2) AS adj_low_price,
+        ROUND(adj_open_price, 2) AS adj_open_price,
+        industry_level2,
+        industry_level3
+    FROM LimitedRangeStockData
+    ORDER BY stock_code, trade_date;
     """
+    
+    # 获取查询结果
+    results_df = con.execute(query_sql).fetchdf()
+    
+    # 关闭连接
+    con.close()
 
-    print("\n---------- 分析查询计划 (DuckDB) -------")
-    print("--------------------------------------\n")
+    #返回查询结果
+    return results_df
+
+def find_support_and_dip_dates(
+    limited_adjusted_df: pd.DataFrame, 
+    targets: List[Dict[str, str]]
+) -> pd.DataFrame:
+    """
+    根据 DuckDB 预处理的 limited_adjusted_df，查找回踩日。
+    
+    【修改内容】
+    1. 忽略突破日后的第一个交易日作为回踩备选。
+    2. 收集所有符合条件的回踩日。
+    """
+    results = []
+    
+    # 确保 trade_date 是日期类型
+    limited_adjusted_df['trade_date'] = pd.to_datetime(limited_adjusted_df['trade_date'])
+
+    for target in targets:
+        stock_code = target['stock_code']
+        breakthrough_date_str = target['breakthrough_date']
+        stock_name = target['stock_name']
+        
+        try:
+            breakthrough_date_dt = pd.to_datetime(breakthrough_date_str)
+        except ValueError:
+            print(f"Skipping {stock_code}: Invalid breakthrough_date format.")
+            continue
+
+        # 1. 筛选目标股票数据
+        stock_df = limited_adjusted_df[limited_adjusted_df['stock_code'] == stock_code].sort_values('trade_date').reset_index(drop=True)
+        
+        # 2. 确定突破日和支撑价
+        breakthrough_row = stock_df[stock_df['trade_date'] == breakthrough_date_dt]
+        
+        if breakthrough_row.empty:
+            continue
+        
+        # 获取支撑价和支撑日期
+        support_price = breakthrough_row['adj_support_price'].iloc[0]
+        support_date_dt = breakthrough_row['adj_support_date'].iloc[0] # 注意：这里使用 adj_support_date
+        
+        if support_price is None or support_price == 0:
+            continue
+
+        # 3. 确定回踩窗口 (Dip Window)
+        
+        # 突破日位置
+        breakthrough_pos = stock_df.index.get_loc(breakthrough_row.index[0])
+        
+        # 【修改点 1：忽略突破日后的第一个交易日】
+        # 回踩窗口从突破日后的第二个交易日开始
+        # dip_start_pos 原为 breakthrough_pos + 1
+        dip_start_pos = breakthrough_pos + 2 
+        
+        # 提取回踩窗口的数据：从突破日后第二天到数据结束
+        # 确保 dip_start_pos 不会超出数据范围
+        if dip_start_pos >= len(stock_df):
+             # 没有足够的数据来继续查找回踩，跳过当前股票
+             continue
+             
+        dip_window_df = stock_df.iloc[dip_start_pos:].copy()
+        
+        
+        # 4. 寻找所有回踩日 (Dip Dates)
+        dip_dates = [] 
+        
+        if not dip_window_df.empty:
+            # 找到所有符合条件的备选回踩日（逻辑不变）
+            # A. 备选回踩日当天的最高价(adj_high_price)和最低价(adj_low_price)*99.5%要包含支持价
+            condition_A = (dip_window_df['adj_high_price'] >= support_price) & \
+                          (dip_window_df['adj_low_price'] * SUPPORT_PRICE_TOLERANCE <= support_price)
+            
+            # B. 备选回踩日当天的收盘价(adj_close_price)高于支持价(support_price)
+            condition_B = dip_window_df['adj_close_price'] > support_price
+            
+            # C. 备选回踩日当天的波动性小于 VOLATILITY_LIMIT
+            # condition_C = (abs(dip_window_df['adj_close_price'] - dip_window_df['adj_open_price']) / dip_window_df['adj_open_price']) < VOLATILITY_LIMIT
+            
+            # candidate_dips = dip_window_df[condition_A & condition_B & condition_C]
+
+            candidate_dips = dip_window_df[condition_A & condition_B]
+            
+            
+            if not candidate_dips.empty:
+                # 【修改点 2：收集所有回踩日】
+                # 将所有符合条件的日期转换为 YYYY-MM-DD 字符串，并收集到一个列表中
+                dip_dates = [dt.strftime('%Y-%m-%d') for dt in candidate_dips['trade_date'].tolist()]
+
+        # 5. 记录结果
+        # 【修改点 2：将多个回踩日连接成一个字符串】
+        # dip_date_str = ", ".join(dip_dates) if dip_dates else None
+        
+        # =============== 【新增过滤逻辑】 ===============
+        if not dip_dates:
+            # 如果 dip_dates 列表为空，则跳过本次循环，不将结果添加到 results
+            continue
+        # ===============================================
+
+        for dip_date in dip_dates:
+            results.append({
+                'stock_code': stock_code,
+                'stock_name': stock_name,
+                # 确保突破日和支撑日格式统一为 YYYY-MM-DD 字符串
+                'breakthrough_date': breakthrough_date_dt.strftime('%Y-%m-%d'),
+                'support_price': support_price,
+                'support_date': support_date_dt.strftime('%Y-%m-%d'),
+                'dip_date': dip_date
+            })
+
+    return pd.DataFrame(results)
+
+
+if __name__ == '__main__':
+    # 获取数据
+    target_df = load_target_df("Table.xlsx")
+    target_df['breakthrough_date'] = pd.to_datetime(target_df['breakthrough_date'])
+    stock_data_list = target_df[['breakthrough_date', 'stock_code', 'stock_name']].to_dict('records')
 
     print("\n执行筛选...")
     start_time = time.time()
-    results_df = con.execute(query_sql).fetchdf() # Fetch results directly as a Pandas DataFrame
+
+    # 2. 计算前复权数据
+    MAX_HOLDING_DAYS = 40
+    limited_df = get_next_N_days_data(stock_data_list, MAX_HOLDING_DAYS)
+
+    # 3. 查找支撑价和回踩日
+    final_results = find_support_and_dip_dates(limited_df, stock_data_list)
     
-
-    # 按 stock_code 和 trade_date 升序排序
-    results_df = results_df.sort_values(['股票代码', '突破日期'], ascending=[True, True]).reset_index(drop=True)
-
-    if use_cond_1_1_or_cond_1_2 == "1.1":
-        results_df = apply_mark_records(results_df)
-        if 'delete_flag' not in results_df.columns:
-            results_df['delete_flag'] = 0
-        results_df = results_df[results_df['delete_flag'] == 0].drop(columns='delete_flag').reset_index(drop=True)
-
-    if use_cond_1_1_or_cond_1_2 == "1.2":
-        results_df = results_df.groupby('股票代码', group_keys=False).apply(filter_records).reset_index(drop=True)
+    # 4. 输出结果
+    # print("\n--- 最终结果 ---")
+    # print(final_results[['stock_code', 'stock_name', 'breakthrough_date', 'support_price', 'dip_date']].to_markdown(index=False))
 
     end_time = time.time()
     print(f"筛选于: {end_time - start_time:.2f}秒内完成.")
 
-    if not results_df.empty:
-        num_results = len(results_df)
-        print(f"\n筛选到 {num_results} 条股票及交易日期数据:")
-        if num_results > 50:
-            print("...")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            if use_cond_1_1_or_cond_1_2 == '1.2':
-                filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2_cond1.2_{range_days_of_cond_1_2}days_{apply_cond5_or_not}_cond5"
-            else:
-                filter_conditions = f"{history_trading_days}days_{main_board_amplitude_threshold}per_{non_main_board_amplitude_threshold}per_{apply_cond2_or_not}_cond2_{apply_cond5_or_not}_cond5"
-            output_filename = f"stock_query_results_{timestamp}_cond{use_cond_1_1_or_cond_1_2}_{filter_conditions}.csv"
-            try:
-                results_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
-                print(f"筛选结果 (共 {num_results} 条记录) 已导出到文件 {output_filename}.")
-            except Exception as e:
-                print(f"导出到文件失败，原因: {e}")
-        print(f"总记录数: {num_results} 条.")
-    else:
-        print("\n没有找到符合条件的股票及期交易日期数据.")
-
-    # Close the database connection
-    con.close()
-
-if __name__ == '__main__':
-    optimize_and_query_stock_data_duckdb()
+    # 5. 导出到 Excel 文件
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_file_name = f'回踩筛选结果_{timestamp}.xlsx'
+    
+    # 导出时，只保留您要求的四列（加上支撑价方便检查）
+    columns_to_export = [
+        'stock_code', 
+        'stock_name', 
+        'breakthrough_date', 
+        'dip_date',
+        'support_date',
+        'support_price' # 导出支撑价方便查看
+    ]
+    
+    # 使用 to_excel 方法导出
+    final_results[columns_to_export].to_excel(
+        excel_file_name, 
+        index=False # 不导出 pandas 的行索引
+    )
+    
+    print(f"\n✅ 结果已成功导出到文件: {excel_file_name}")
